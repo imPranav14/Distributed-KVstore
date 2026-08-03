@@ -1,0 +1,13 @@
+# Build output
+/bin/
+
+# Per-node data directories (WAL files, snapshots) created by running nodes
+/data/
+
+# Generated protobuf/gRPC Go code (Milestone 3 adds the source .proto files;
+# generated *.pb.go / *_grpc.pb.go are reproducible via `make proto`)
+*.pb.go
+
+# OS/editor cruft
+.DS_Store
+*.swp
