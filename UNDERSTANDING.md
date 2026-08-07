@@ -284,4 +284,129 @@ What was missing: nothing wrong, but worth naming concretely for this codebase �
 
 ---
 
+## Milestone 2 — Client Request IDs and Server-Side Duplicate Detection
+Date: 2026-08-05
+
+### The Problem This Solves
+A client that times out waiting for a response cannot tell "my request never
+arrived" from "it arrived, was applied, and the response was lost." Its only
+safe move is to retry. But a naive retry, reapplied without recognition,
+doesn't just repeat a harmless operation — it can land *after* a different
+client's newer write and silently overwrite it, a lost update with no error
+and no signal. This gives us at-most-once semantics: a given client request
+is applied to the store at most once, no matter how many times the network
+causes it to be resent. Built now, before gRPC (Milestone 3) exists, so the
+mechanism is proven correct with plain Go calls before any network flakiness
+is layered on top.
+
+### The Design Decision Made
+Chose a bounded table (Option B) that remembers only the *most recent*
+RequestID per client, over an unbounded table remembering every request ever
+made (Option A). Option B relies on clients keeping at most one request in
+flight at a time (retry the same request; never send the next one before the
+current one is acknowledged) — matching the sequential-retry model implied
+by `internal/client`. This directly resolves the unbounded-growth concern
+flagged in Milestone 1's interview (Q3), rather than reintroducing it.
+
+New package `internal/dedup`, kept separate from both `internal/store`
+(which explicitly promises to know nothing about Raft/gRPC/dedup) and any
+future transport code — not in the original file tree, added as a design
+decision confirmed with the user.
+
+Within `Table.Execute`, the lock is held across the caller-supplied
+`applyFn`, rather than exposing separate `Check`/`Record` methods. Separating
+them would reopen a race window between checking and recording — proven
+directly in Break 1 below.
+
+### How It Works — Plain English
+`Table` maps each `ClientID` to the last `RequestID` it processed. When a
+request comes in, `Execute` compares the incoming `RequestID` to the last one
+recorded for that client: if it's less than or equal, the request is a
+duplicate (either an exact retry, or an even staler retry from before the
+client's most recent request) and is silently ignored. If it's greater, it's
+new work — the caller's operation runs, and the table remembers this as the
+new latest RequestID for that client. All of this happens under one lock, so
+two goroutines racing in with the same request can never both "win" the
+check.
+
+### Key Invariants
+- INVARIANT: `applyFn` runs while `t.mu` is held. This makes "check" and
+  "apply and record" one atomic step, closing the exact TOCTOU race Break 1
+  reintroduces below.
+- INVARIANT: `applyFn` must never call back into the same `Table` — Go's
+  `sync.Mutex` is not reentrant, so that would deadlock every time.
+- INVARIANT: lock ordering across the codebase must always acquire `dedup.Table`'s
+  lock before `store.Store`'s lock, never the reverse, to avoid a
+  lock-ordering cycle between the two packages.
+
+### The Lines That Matter Most
+
+Line: `if last, seenBefore := t.lastSeen[clientID]; seenBefore && requestID <= last`
+Does: classifies an incoming request as exact-retry (`==`), stale-older-retry (`<`), or genuinely new (`seenBefore` false, or `requestID > last`).
+Breaks without it: proven in Break 2 — using `<` instead of `<=` forgets the exact-retry case and reapplies operations on the very first retry.
+Why this way: `seenBefore` is checked first so a brand-new client's zero-value map lookup (`RequestID(0)`) is never mistaken for "already processed request 0."
+
+Line: `applyFn()` called before `t.lastSeen[clientID] = requestID`, both inside the same locked section
+Does: makes "run the operation" and "record that it ran" a single atomic unit.
+Breaks without it: proven in Break 1 — releasing the lock between check and record lets multiple goroutines all pass the check before any of them records it, reapplying the same request many times over.
+Why this way: simplest way to get true atomicity, at the explicit cost of requiring `applyFn` to be fast.
+
+### What Breaks and Why
+
+**Break 1 — release the lock before calling `applyFn`, re-acquire it to record**
+Change: split the single locked section into "check" (locked), "apply" (unlocked), "record" (locked) — a plausible "reduce lock contention" optimization.
+Prediction: `TestExecute_ConcurrentSameRequest_AppliesExactlyOnce` fails with `applyCount` > 1.
+Observed: passed 30 consecutive runs unmodified — the window between unlock and re-lock was too narrow to hit by scheduling luck with a near-instant `applyFn`. Widening it with a temporary `time.Sleep(time.Millisecond)` inside the test's `applyFn` made the bug reproduce immediately and consistently: `applyFn` ran 50 times instead of 1. Confirmed with plain `go test` — **not** `-race`; the race detector reported nothing, because every individual map access remained correctly protected by the lock (`-race` never saw an unsynchronized memory access to flag). The bug is a TOCTOU logic race spanning two critical sections, a category of bug invisible to happens-before analysis.
+Why wrong at a deep level: correctness properties that span multiple lock acquisitions cannot be verified by looking at any single critical section in isolation — and cannot be caught by tooling that only reasons about memory synchronization, only by reasoning about the protocol itself.
+
+**Break 2 — `requestID < last` instead of `requestID <= last`**
+Change: one-character off-by-one, dropping the exact-retry case from the stale-duplicate check.
+Prediction: `TestExecute_DuplicateRequest_SameID_DoesNotReapply` fails; a retry with the exact same RequestID gets reapplied.
+Observed: exactly as predicted — `wasDuplicate` came back `false` for an exact retry, and `applyFn` would have run twice.
+Why wrong at a deep level: the smallest possible code change (one comparison operator) directly reintroduces the lost-update scenario from the concept brief — proof that this invariant needs a dedicated test, not just careful code review, since a one-character typo is easy to miss by eye.
+
+### Interview Questions and Answers
+
+Q1: Why didn't `-race` catch Break 1, given it's a genuine concurrency bug? What category of bug is invisible to both plain testing and the race detector, and why?
+A: The bug was a logic race, not a data race, so `-race` couldn't detect it.
+Assessment: needs more depth.
+What was missing: the mechanism. `-race` does happens-before analysis on individual memory accesses; every map access in Break 1 was still correctly wrapped in `Lock()`/`Unlock()`, so there was no unsynchronized access to flag. The bug lived in an application-level invariant spanning two separate critical sections — a named category, TOCTOU (time-of-check-to-time-of-use) — which no memory-synchronization tool can see.
+
+Q2: `Execute` holds the lock across `applyFn`. What's the actual cost, specifically, and when does it become a real problem rather than a theoretical one?
+A: Serializes all clients; fine now, a bottleneck under high concurrency.
+Assessment: needs more depth.
+What was missing: specifics. It serializes clients writing to *completely unrelated keys* against each other, even though `store.Store`'s own `RWMutex` could run them in parallel. The sharper timing question: does this matter more at Milestone 3 (plain gRPC, genuinely concurrent unrelated writes, no other serialization yet) or Milestone 7 (Raft's own single-leader log ordering may already dominate as the real bottleneck)?
+Holding t.mu across applyFn serializes every write request, even when they come from different clients operating on completely unrelated keys. For example, a PUT to "user:1" from client A blocks a simultaneous PUT to "user:999" from client B purely because both must pass through the single dedup mutex. That contention is avoidable with sharded or per-client locking because dedup state is independent across clients. This matters most in Milestone 3, where the gRPC server can otherwise process unrelated requests concurrently. Once Raft is introduced, however, writes are already serialized by the leader's log and majority replication, so consensus latency is likely to dominate and the dedup mutex becomes a much smaller contributor to overall throughput.
+
+Q3: What happens if a client restarts, loses its in-memory request counter, and resends RequestIDs starting low again to a server that already has a high last-seen value for that ClientID? Whose bug is that?
+A: Breaks the protocol; belongs to the client/session layer, not the dedup table.
+Assessment: strong.
+What was missing: the concrete fix — ClientID must represent a session, not a persistent process identity. A client should mint a fresh ClientID (e.g. a new random UUID) on every restart so a reset counter lands in a new table entry instead of colliding with stale state.
+
+Q4: This table never forgets a client — does Milestone 1's "unbounded growth is out of scope" verdict apply here too, or is this different?
+A: Store growth is application data; dedup growth is metadata that should eventually be garbage-collected.
+Assessment: good distinction, missing the hard part.
+What was missing: garbage collecting dedup entries isn't free. Evicting a client's entry too early and then receiving one more genuine retry causes the table to treat it as a new client and reapply an already-applied operation — silently reintroducing the exact bug this milestone exists to prevent. Safe eviction needs an explicit session-close signal or a timeout provably longer than any client's max retry window, not a naive TTL.
+
+Q5: The moment Milestone 3 wires this into real gRPC handlers, clients need an actual response, not just "did it apply." What has to change, and why wasn't it built now?
+A: `Execute` will eventually return results/errors; the simpler API is appropriate until those requirements exist.
+Assessment: strong.
+What was missing: it's not just `applyFn`'s signature that changes — `Execute`'s *duplicate path* currently returns no payload at all, which only works because `Put`/`Delete` have nothing to return. Once there's a real response, the duplicate path must cache and replay it, not just suppress re-application.
+
+### Git Commit Message
+`feat: add request-ID dedup table for at-most-once write semantics`
+
+### Open Questions
+- Dedup table has no eviction — acceptable for now (bounded by active client
+  count, not total requests), but any future GC must be tied to an explicit
+  session-close signal, not a naive timeout, per the Q4 correction above.
+- `Execute`'s API will need to grow a cached-response payload once Milestone
+  3 wires it to real gRPC handlers — deferring that design until then rather
+  than guessing now, per the Q5 correction.
+- Which operations actually go through this table? Currently assumed to be
+  PUT/DELETE only — GET is naturally side-effect-free and doesn't need
+  dedup. Revisit if any future milestone adds a read-modify-write operation.
+
+---
+
 <!-- All future entries go below this line, in chronological order -->
