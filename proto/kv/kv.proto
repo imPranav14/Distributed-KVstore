@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package kv;
+
+option go_package = "github.com/imPranav14/Distributed-KVstore/proto/kv;kvpb";
+
+// KVStore is the client-facing service. At this milestone each node serves
+// requests against its own local store — no replication or consensus yet.
+service KVStore {
+    rpc Get(GetRequest) returns (GetResponse);
+    rpc Put(PutRequest) returns (PutResponse);
+    rpc Delete(DeleteRequest) returns (DeleteResponse);
+}
+
+// GetRequest has no client_id/request_id: Get is read-only and
+// side-effect-free, so replaying it any number of times is always safe. It
+// never goes through the server's dedup table.
+message GetRequest {
+    string key = 1;
+}
+
+message GetResponse {
+    string value = 1;
+    bool found = 2;
+}
+
+// INVARIANT: once a field number below is used in a released version of
+// this file, it must never be reused for a different field, even if the
+// field is renamed — protobuf's wire format identifies fields by number,
+// not by name, and reusing a number breaks compatibility between old and
+// new binaries reading the same bytes.
+
+message PutRequest {
+    string key = 1;
+    string value = 2;
+    string client_id = 3;
+    uint64 request_id = 4;
+}
+
+// Empty: store.Store.Put has no return value, and gRPC's own status code
+// (OK vs. error) is how the client learns whether the call succeeded.
+message PutResponse {}
+
+message DeleteRequest {
+    string key = 1;
+    string client_id = 2;
+    uint64 request_id = 3;
+}
+
+// Empty, same reasoning as PutResponse.
+message DeleteResponse {}

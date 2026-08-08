@@ -376,7 +376,7 @@ Q2: `Execute` holds the lock across `applyFn`. What's the actual cost, specifica
 A: Serializes all clients; fine now, a bottleneck under high concurrency.
 Assessment: needs more depth.
 What was missing: specifics. It serializes clients writing to *completely unrelated keys* against each other, even though `store.Store`'s own `RWMutex` could run them in parallel. The sharper timing question: does this matter more at Milestone 3 (plain gRPC, genuinely concurrent unrelated writes, no other serialization yet) or Milestone 7 (Raft's own single-leader log ordering may already dominate as the real bottleneck)?
-Holding t.mu across applyFn serializes every write request, even when they come from different clients operating on completely unrelated keys. For example, a PUT to "user:1" from client A blocks a simultaneous PUT to "user:999" from client B purely because both must pass through the single dedup mutex. That contention is avoidable with sharded or per-client locking because dedup state is independent across clients. This matters most in Milestone 3, where the gRPC server can otherwise process unrelated requests concurrently. Once Raft is introduced, however, writes are already serialized by the leader's log and majority replication, so consensus latency is likely to dominate and the dedup mutex becomes a much smaller contributor to overall throughput.
+Holding t.mu across applyFn serializes every write request, even when they come from different clients operating on completely unrelated keys. For example, a PUT to "user:1" from client A blocks a simultaneous PUT to "user:999" from client B purely because both must pass through the single dedup mutex. That contention is avoidable with sharded or per-client locking because dedup state is independent across clients. This matters most in Milestone 3, where the gRPC server can otherwise process unrelated requests concurrently. Once Raft is introduced, however, writes are already serialized by the leader's log and majority replication, so consensus latency is likely to dominate and the dedup mutex becomes a much smaller contributor to overall throughput. So after Raft, the dedup table is still required. What changes is that its global mutex is less likely to be the main performance bottleneck, because Raft's consensus process already serializes writes and introduces significantly more latency than acquiring the dedup lock.
 
 Q3: What happens if a client restarts, loses its in-memory request counter, and resends RequestIDs starting low again to a server that already has a high last-seen value for that ClientID? Whose bug is that?
 A: Breaks the protocol; belongs to the client/session layer, not the dedup table.
@@ -406,6 +406,176 @@ What was missing: it's not just `applyFn`'s signature that changes — `Execute`
 - Which operations actually go through this table? Currently assumed to be
   PUT/DELETE only — GET is naturally side-effect-free and doesn't need
   dedup. Revisit if any future milestone adds a read-modify-write operation.
+
+---
+
+## Milestone 3 — gRPC Layer: Proto, KV Server, and Client with Retries
+Date: 2026-08-08
+
+### The Problem This Solves
+Everything built through Milestone 2 only existed as Go objects called
+directly by test functions in one process. A "distributed" KV store that
+can't be reached over a network isn't distributed — it's several unrelated
+single-node programs sharing a docker-compose file. This milestone puts a
+real network boundary around `store.Store` + `dedup.Table`: a client process
+can now call PUT/GET/DELETE on a server process and get a real answer back
+over the wire. Scope note: no replication or consensus yet — each node
+serves requests against its own local state only, proving the network
+plumbing works before Raft (Milestones 5-7) makes multiple nodes agree.
+
+Split into three sub-steps per Rule 2 (small diffs): 3a (proto + codegen),
+3b (server), 3c (client). One consolidated entry here covers all three plus
+wiring `cmd/node/main.go` to actually start the server.
+
+### The Design Decision Made
+**gRPC + protobuf** was already fixed by CLAUDE.md's tech stack table, not
+re-litigated here — grounded instead in *why*: a strongly-typed generated
+contract (a typo in a field name is a compile error, not a runtime JSON
+surprise), smaller/faster binary encoding, and — the one that matters most
+for this project specifically — native HTTP/2 bidirectional streaming,
+which Raft's `AppendEntries` heartbeats (Milestone 6) will benefit from.
+
+**3a — proto shape:** separate unary RPCs (`Get`/`Put`/`Delete`, each
+strongly typed) over one generic `Execute(Operation)` RPC with an
+enum/oneof — the generic version solves a flexibility problem this project
+doesn't have (we know exactly three operations today), which is exactly the
+premature abstraction Rule 3 warns against. `GetRequest` carries no
+`client_id`/`request_id` at all: `Get` is read-only and side-effect-free, so
+replaying it is always safe — it never goes through dedup, a decision
+`kv.proto` enforces at the schema level, not just by convention.
+
+**3b — server ownership model:** `KVServer` owns a concrete `*store.Store`
+and `*dedup.Table` directly (Stance 1), not an interface anticipating a
+future Raft-backed implementation (Stance 2). We don't yet know the right
+shape for a Raft-facing abstraction, since Raft doesn't exist yet — Milestone
+7's explicit job is to rewire this file's write path through consensus, and
+guessing at that interface now would mean designing against requirements we
+don't understand yet (Rule 2/3).
+
+**3c — client identity and retries:** `ClientID` is self-generated (a random
+UUID at construction) rather than server-assigned via a `RegisterClient` RPC
+— the paper's server-assigned approach exists to make registration itself
+linearizable through a replicated log, which doesn't exist until Milestone
+5+. Retry strategy is exponential backoff (100ms→200ms→400ms...capped at
+2s, 5 attempts) rather than fixed-interval, per explicit user choice over my
+own lean toward fixed-interval for this milestone's single-node scope.
+`internal/client` deliberately does not import `internal/dedup` — the client
+only needs to produce raw `string`/`uint64` values matching the proto wire
+fields; the two sides are connected through the `.proto` contract, not a
+shared Go type.
+
+### How It Works — Plain English
+`kv.proto` defines the `KVStore` service and its request/response messages;
+`make proto` (now actually functional, using `protoc-gen-go`/
+`protoc-gen-go-grpc` installed via `go install`) generates the Go types and
+interfaces both sides depend on. `KVServer` (`internal/server`) implements
+that generated interface: `Get` reads straight from `store.Store`; `Put`/
+`Delete` convert the proto's `client_id`/`request_id` fields into `dedup`'s
+named types and route the actual store mutation through
+`dedup.Table.Execute`, so a retried write is never reapplied. `Client`
+(`internal/client`) wraps a generated gRPC stub, generates its own
+`ClientID` once at construction, allocates a fresh `RequestID` once per
+logical `Put`/`Delete` call (reused across every retry of that same call),
+and retries with exponential backoff — each attempt individually
+timeboxed via `context.WithTimeout`, and the whole retry loop responsive to
+the caller's own context cancellation. `cmd/node/main.go` now actually
+starts a `grpc.Server` on `GRPC_PORT`, serving in a goroutine whose
+documented exit is `grpcServer.GracefulStop()` on shutdown signal — verified
+against a real compiled binary and a real client over a real loopback
+socket, not just unit tests.
+
+### Key Invariants
+- INVARIANT (`kv.proto`): once a field number is used in a released version,
+  it must never be reused for a different field — protobuf's wire format
+  identifies fields by number, not name.
+- INVARIANT (`kv_server.go`): `KVServer` embeds `kvpb.UnimplementedKVStoreServer`
+  by value (not pointer, per its own doc comment) — required for
+  `*KVServer` to satisfy `kvpb.KVStoreServer` at all, and for forward
+  compatibility when `kv.proto` grows new RPCs.
+- INVARIANT (`client.go`): `Client` is not safe for concurrent use by
+  multiple goroutines — not an implementation gap, a direct consequence of
+  Milestone 2's dedup design, which assumes at most one request in flight
+  per client.
+- INVARIANT (`client.go`): a given logical `Put`/`Delete` call's `requestID`
+  is allocated exactly once, before the retry loop starts, and reused by
+  every retry attempt of that same call — proven directly by Break 1 below.
+
+### The Lines That Matter Most
+
+Line: `s.dedup.Execute(clientID, requestID, func() { s.store.Put(req.Key, req.Value) })` (`kv_server.go`)
+Does: routes every write through the atomic check-or-apply-and-record path from Milestone 2, rather than touching the store directly.
+Breaks without it: proven in 3b Break 1 — bypassing this and calling `store.Put` directly reapplies retried requests, reintroducing the exact lost-update bug from Milestone 2's concept brief.
+Why this way: this is also the exact call site that exercises the Milestone 2 lock-ordering invariant — dedup's lock is held first, store's lock is taken second, inside the closure, never the reverse.
+
+Line: `requestID := c.nextRequestID; c.nextRequestID++` (`client.go`, before the retry loop)
+Does: allocates this logical call's `requestID` once, before any network activity.
+Breaks without it: proven in 3c Break 1 — moving this inside the retried closure gives every retry attempt a new id, defeating server-side dedup entirely from the client side.
+Why this way: allocation happens once per logical *operation*, not once per network *attempt* — the distinction the whole dedup design rests on, now enforced on both ends of the wire.
+
+Line: `select { case <-time.After(backoff): ... case <-ctx.Done(): return ... }` (`client.go`)
+Does: waits for backoff to elapse OR the caller's context to be cancelled, whichever comes first.
+Breaks without it: proven in 3c Break 2 — a plain `time.Sleep(backoff)` ignores cancellation, leaving a caller who's already given up stuck waiting out the full backoff schedule anyway.
+Why this way: this is the one place in the retry loop where the client is otherwise idle — exactly where respecting cancellation costs nothing.
+
+Line: `clientID := dedup.ClientID(1)` — the Break 2 hardcode in `kv_server.go`'s `Delete` (restored, but worth remembering)
+Does (when broken): silently collides a `Delete`'s dedup entry with an earlier `Put`'s, causing the `Delete` to be treated as a stale duplicate and never actually run.
+Why it mattered: the most dangerous class of bug in this milestone's break-it exercises — no crash, no error, the operation just silently doesn't happen. `TestDelete_RemovesKey` exists specifically to catch this.
+
+### What Breaks and Why
+
+**3b Break 1 — bypass `dedup.Execute`, call `store.Put` directly in `Put`**
+Prediction: `TestPut_DuplicateRequestID_NotReapplied` fails, retry reapplies with the second (wrong) value.
+Observed: exactly as predicted — `Get` returned `"second-should-be-ignored"` instead of `"first"`.
+Why wrong at a deep level: this is the server-side version of the exact bug Milestone 2 exists to prevent — proof that the protection has to be re-verified at every layer that could accidentally route around it, not just at the layer where it was originally built.
+
+**3b Break 2 — hardcoded `requestID := dedup.RequestID(1)` in `Delete`**
+Prediction: `TestDelete_RemovesKey` fails; `Delete`'s fabricated `requestID` collides with the `Put`'s real one, so dedup treats the `Delete` as already-seen and never runs it.
+Observed: exactly as predicted — `Get` after `Delete` still found the key present.
+Why wrong at a deep level: no crash, no error — the most operationally dangerous kind of bug in this set, easily misattributed to the client during real debugging.
+
+**3c Break 1 — allocate `requestID` inside the retried closure instead of once per call**
+Prediction: `TestPut_RetriesReuseSameRequestID` (a new test, added specifically because auditing the correct code revealed no existing test actually checked retries reuse one id) fails — each attempt gets a different, incrementing id.
+Observed: exactly as predicted — attempt 0 used `RequestId=0`, attempt 1 used `RequestId=1`.
+Why wrong at a deep level: this is the client-side mirror of 3b's Break 1 — the guarantee has exactly two load-bearing halves (client reuses the id, server recognizes the reuse), and breaking either one alone is enough to defeat the whole mechanism.
+
+**3c Break 2 — `time.Sleep(backoff)` instead of a `select` on `ctx.Done()`**
+Prediction: `TestPut_ContextCancelled_StopsRetryingEarly` fails, taking the full ~1.5s backoff schedule instead of stopping promptly at cancellation.
+Observed: exactly as predicted — 1.5s instead of a quick exit.
+Why wrong at a deep level: a caller that cancelled because *they* gave up would be left waiting on a client that's uselessly sleeping through retries for a request nobody wants an answer to anymore.
+
+### Interview Questions and Answers
+
+Q1: Walk through what happens when a client's Put succeeds server-side but the response is lost — how many times does store.Put run, and which code is responsible?
+A: Exactly-once semantics come from client retrying with the same RequestID and server-side deduplication, so store.Put() executes exactly once.
+Assessment: needs more depth.
+What was missing: the actual hop-by-hop mechanism — attempt 1 applies and records `lastSeen`, but the client never learns this; attempt 2 (same requestID) hits `dedup.Execute`'s `requestID <= last` check, which is the single comparison responsible for `store.Put` not running a second time. Also: "exactly-once" is client-retry-until-success + server-at-most-once, not true exactly-once, a distinction Milestone 2 was careful about.
+
+Q2: Why does GetRequest carry no ClientId/RequestId? What hypothetical change would make that wrong?
+A: Get doesn't need deduplication because it's read-only; any state-changing behavior (like incrementing access counts) would invalidate that assumption.
+Assessment: strong.
+
+Q3: Concretely, what breaks at compile time without UnimplementedKVStoreServer embedded, and for whom?
+A: Embedding UnimplementedKVStoreServer keeps old server implementations compiling when new RPCs are added by supplying default implementations.
+Assessment: needs more depth.
+What was missing: the concrete mechanism — without it, `*KVServer` stops satisfying `kvpb.KVStoreServer` the moment a new RPC is added, and every call site doing `kvpb.RegisterKVStoreServer(...)` (main.go, kv_server_test.go, client_test.go) fails to compile with a "missing method" error, even though none of those files have anything to do with the new RPC.
+
+Q4: Two goroutines call Put concurrently on one Client — walk through exactly what goes wrong.
+A: The immediate race is on nextRequestID, but the deeper issue is violating the protocol's assumption of one outstanding request per client.
+Assessment: strong direction, missing the concrete failure.
+What was missing: the specific outcome — both goroutines can read the same pre-increment value of `nextRequestID` and end up using the *same* requestID for two different logical writes, causing the server's dedup table to treat the second as a duplicate and silently drop it (a lost write, not a double-apply). Also: unlike Milestone 2's Break 1, this specific race (unsynchronized read-modify-write on a plain field) IS the kind `go test -race` would actually catch.
+
+Q5: What does GracefulStop() buy us now, and how does "in-flight" change meaning after Milestone 6?
+A: GracefulStop() lets existing RPCs finish. Today that means finishing a map update; after Raft, it could mean completing log replication and commit before shutting down.
+Assessment: strong.
+
+### Git Commit Message
+`feat: add gRPC KV server and retrying client, wire node to serve real requests`
+
+### Open Questions
+- No TLS/auth on the gRPC connection — explicitly out of scope per CLAUDE.md's project boundaries, not an oversight.
+- Client retry backoff has no jitter — fine with one test client; revisit if a future milestone has many clients retrying against the same node in sync.
+- `internal/server`'s concrete ownership of `*store.Store`/`*dedup.Table` (Stance 1) is expected to be substantially rewired at Milestone 7 when writes must route through Raft consensus — this is anticipated scope for that milestone, not a gap in this one.
+- `proto/raft/raft.proto` still doesn't exist — deferred to Milestone 5, consistent with Milestone 0's just-in-time file creation approach.
 
 ---
 
