@@ -579,4 +579,153 @@ Assessment: strong.
 
 ---
 
+## Milestone 4 — Write-Ahead Log with fsync Durability and Crash Recovery
+Date: 2026-08-10
+
+### The Problem This Solves
+Through Milestone 3, everything this system holds lives only in one Go
+process's heap (`store.Store`'s map). Any crash — `kill -9`, OOM, container
+restart, host reboot — loses everything instantly, directly contradicting
+CLAUDE.md's own opening description (`PUT("user:123","alice") → stores the
+pair, survives node crashes`). This also matters structurally, not just as a
+feature gap: Raft (Milestones 5-7) doesn't invent durability — it assumes
+each node already knows how to persist and recover its own log, and
+replicates that guarantee across nodes. A WAL is a prerequisite Raft is
+built on top of, not an add-on.
+
+Split into 4a (WAL entry format, framing, fsync, replay — built and tested
+standalone) and 4b (wiring into the server's write path and startup
+replay), matching the pattern from Milestones 3 and this project's Rule 2.
+
+### The Design Decision Made
+**Entry format:** binary, length-prefixed (`[4-byte length][payload]`,
+payload itself `[1-byte op][4-byte keyLen][key][4-byte valueLen][value]`)
+over text/JSON-per-line — length-prefixing makes partial-write detection a
+designed part of the format rather than an accident of a text parser
+failing to parse a truncated line, and matches CLAUDE.md's stated
+philosophy ("no abstraction hiding what fsync does").
+
+**fsync frequency:** every `Append` fsyncs before returning, rather than
+batching — the simplest correct baseline, and the one the break-it protocol
+assumes. Batching is a throughput optimization with no measured need yet
+(Rule 3).
+
+**Dedup state does NOT persist across a crash** (WAL entries record only
+the store operation, not `client_id`/`request_id`) — a conscious, named
+gap, not a silent one. Confirmed as a real, if narrow, correctness risk by
+the Q5 interview answer below: a stale client retry landing after a crash
+can overwrite a different client's newer write, since the fresh
+`dedup.Table` has no memory of the original request. Accepted for this
+milestone because the harm is bounded and understood, not because it's
+harmless.
+
+**`dedup.Table.Execute`'s signature changed** (`func()` → `func() error`,
+return value gained an `error`) — the first real failure mode the write
+path has ever had (WAL I/O can fail; nothing before this milestone could).
+Critically, `lastSeen` is recorded **only on success** — recording it on
+failure would make a failed write permanently unretryable, since the
+client's identical retry would then be mistaken for an already-handled
+duplicate.
+
+### How It Works — Plain English
+`wal.Entry`/`Encode`/`DecodeEntry` (entry.go) define one log record and how
+it's serialized, with every length bounds-checked before slicing so
+corrupted input becomes an error, never a panic. `wal.WAL` (wal.go) wraps an
+append-only file: `Append` writes the framed entry and fsyncs before
+returning — a caller only treats a write as durable once `Append` returns
+nil — and `ReadAll` replays every complete entry from the start, stopping
+silently at the first *safe* truncation (too few bytes present — the
+expected shape of a crash mid-write) but returning a hard error on the
+first *unsafe* inconsistency (exactly enough bytes were present, but the
+content doesn't decode — real corruption, not an expected crash artifact).
+`kv_server.go`'s `Put`/`Delete` now append to the WAL *inside* the
+`dedup.Execute` closure, before touching the store — write-ahead, log
+first, apply second — and translate a WAL failure into a real gRPC error
+(`codes.Internal`) for the first time. `main.go` opens the WAL, replays it
+into a fresh `store.Store` *before* the gRPC server starts accepting any
+requests, and closes the WAL on graceful shutdown alongside the gRPC
+server.
+
+### Key Invariants
+- INVARIANT (`wal.go`): a caller must not treat a write as durable until
+  `Append` returns nil — the fsync inside is what actually makes that true.
+- INVARIANT (`wal.go`): `Append` is lock-protected; `ReadAll` is not,
+  because it is only ever called once at startup, before any concurrent
+  `Append` begins — a documented precondition, not an oversight.
+- INVARIANT (`dedup.go`, new this milestone): `lastSeen` is updated only
+  when `applyFn` succeeds — a failed operation must remain retryable.
+- INVARIANT (`main.go`): WAL replay must complete before the gRPC server
+  accepts any request.
+
+### The Lines That Matter Most
+
+Line: `if err := w.file.Sync(); err != nil { ... }` (`wal.go`, end of `Append`)
+Does: forces the OS to flush its page cache for this file to physical storage before returning.
+Breaks without it: proven in Break 1 — every existing test still passes, because none of them simulate a real crash. The actual danger (data lost on power loss/kernel panic) is provably *not* reproducible with a process-level `kill -9` either — see the crash-experiment writeup below.
+Why this way: the single line that turns "the OS accepted these bytes" into "this survives a real crash" — the entire reason this milestone exists.
+
+Line: the two different `err == io.EOF || err == io.ErrUnexpectedEOF` branches vs. the `DecodeEntry` failure branch in `ReadAll`
+Does: treats "too few bytes present" as a safe, silent stop, but "exactly enough bytes present, content doesn't decode" as a hard error.
+Breaks without this distinction: real corruption would be indistinguishable from an ordinary, harmless crash-truncation, potentially hiding actual data loss instead of surfacing it. `TestReadAll_TruncatedFinalEntry_IsSafelyIgnored` and `TestReadAll_CorruptEntry_ReturnsError` exist specifically because these two scenarios need different handling.
+Why this way: a length-prefix framing violation (too few bytes) has an innocent, expected cause; a content-decoding violation with the framing intact does not.
+
+Line: `if err := s.wal.Append(...); err != nil { return fmt.Errorf(...) }` placed *before* `s.store.Put(...)`, both inside the `dedup.Execute` closure (`kv_server.go`)
+Does: makes the write durable before it's visible in memory, and makes both steps share one atomic dedup-guarded unit.
+Breaks without this ordering: proven by the Q2 interview discussion — logging after checking dedup (instead of as part of the same guarded step) risks either double-logging duplicates that replay would then wrongly reapply, or losing an in-memory write across a crash before it's ever made durable.
+Why this way: "write-ahead" isn't just a name — the log write has to causally precede the state-machine mutation, every time, with no gap a crash could land in.
+
+Line: `t.lastSeen[clientID] = requestID` moved to run only after `applyFn()` returns nil (`dedup.go`)
+Does: ties dedup's bookkeeping to actual success, not mere attempt.
+Breaks without it: a WAL failure would permanently lock out retries of that exact request — the client would keep resending the same `requestID`, and dedup would keep telling it "already done" forever, even though nothing was ever saved. `TestExecute_ApplyFnFails_NotRecordedAsSeen` exists specifically to catch this regression.
+Why this way: `lastSeen` must mean "this succeeded," not "this was attempted."
+
+### What Breaks and Why
+
+**Break 1 — remove `file.Sync()` (the break CLAUDE.md names explicitly for this milestone)**
+Prediction: all existing tests still pass, because none simulate a real crash.
+Observed: confirmed — all 13 tests passed unmodified.
+The harder ask — "write a test that only catches the bug when the process is killed mid-write" — turned out to be close to a trick question. A real subprocess-`SIGKILL` experiment (`TestCrashSubprocess_SIGKILL_DuringAppend`, run and then deliberately deleted rather than kept as a misleading permanent test) showed the entry survived `SIGKILL` even with `fsync` removed. Why: `SIGKILL` only ends the *process*; the OS page cache is kernel-owned and untouched by a single process dying, so a still-running, still-healthy OS keeps the data available regardless of `fsync`. What `fsync` actually protects against — power loss, kernel panic, a hard VM/host reset — can't be reproduced by a process kill on a live, non-crashing OS. Real crash-consistency testing needs dedicated tools (`dm-flakey`, ALICE/CrashMonkey, hypervisor-level power-cycling), not a unit test. This is arguably the most important lesson of the whole milestone: knowing the limits of what a given testing technique can prove is as important as the fix itself.
+Why wrong at a deep level: `Write()` returning success only means the OS *buffered* the bytes — treating that as "durable" conflates "the syscall didn't error" with "this data will survive a real crash," which are genuinely different guarantees.
+
+**Break 2 — remove the mutex from `Append`**
+Prediction: concurrent `Append` calls interleave their byte writes and corrupt the length-prefix framing; `TestAppend_ConcurrentCalls_NoRace` fails.
+Observed: confirmed, but *intermittently* — roughly half of 10 repeated runs failed with exactly the predicted framing corruption (a garbage `keyLen` from interleaved bytes). Notably, `-race` never flagged anything on any run, even when the test failed — this corruption happens at the OS syscall level (two `write()` calls interleaving in the kernel), not as a Go-level unsynchronized memory access the race detector instruments. A different blind spot than Milestone 2's TOCTOU logic race, but the same lesson: `-race` is not a substitute for reasoning about what a lock actually protects.
+Why wrong at a deep level: the mutex isn't protecting a Go variable here — it's protecting the *file's byte structure* from concurrent, unsynchronized `write()` calls, a category of corruption `-race` has no visibility into at all.
+
+### Interview Questions and Answers
+
+Q1: What did the SIGKILL crash-recovery smoke test actually prove, and what does it not prove?
+A: Proves WAL recovery works, but doesn't prove fsync durability, because page cache can survive process death.
+Assessment: strong.
+
+Q2: Why does wal.Append happen inside the dedup.Execute closure, before store.Put — not before Execute is called, and not after it returns?
+A: Correct order: dedup check → WAL + fsync → store → mark seen. Before = duplicates unnecessarily logged. After = crash can lose a successful store write.
+Assessment: needs more depth.
+What was missing: "before" isn't just wasted disk space — replay has no dedup logic at all, so a duplicate written to the WAL gets unconditionally reapplied on the next restart, reintroducing the exact bug dedup exists to prevent, just deferred to a future replay. "After" isn't about permanent lockout (dedup resets on crash too) — it's that a client can be told a write succeeded while the write itself never became durable, a narrower but still real gap.
+
+Q3: Walk through what ReadAll does if a bit flip corrupts a key-length field without truncating the file.
+A: ReadAll reads the complete frame → DecodeEntry validates keyLen → if invalid, return error. Without checksum, some valid-looking bit corruption may go undetected.
+Assessment: strong, and surfaced a genuine gap.
+The checksum observation is correct and wasn't something I'd already named: a bit flip that still produces an internally-consistent (but wrong) length would decode "successfully" with no error at all, silently returning corrupted data. Real log-structured storage adds a per-entry checksum (e.g. CRC32) specifically to catch this. Added as an open question below.
+
+Q4: Why is recording lastSeen only on success, never on failure, correct?
+A: If a WAL write fails, don't mark it seen — otherwise the retry gets treated as a duplicate even though the write never happened.
+Assessment: strong.
+
+Q5: Find a concrete case where "idempotent PUT/DELETE makes crash-era retries harmless" is false, using two clients and no Raft.
+A: A's PUT(x=100) succeeds, B changes x=200, crash wipes dedup, A retries → x=100. Idempotent ≠ safe against stale retries.
+Assessment: strong.
+This is the concrete instance of the risk this milestone's concept brief flagged as an accepted, named gap — good to see it derived independently.
+
+### Git Commit Message
+`feat: add write-ahead log with fsync durability and crash recovery via WAL replay`
+
+### Open Questions
+- **No per-entry checksum** (surfaced by Q3): a bit flip landing inside a length field that still produces internally-consistent values would decode without error, silently returning corrupted data. Structural validation (bounds-checking) catches gross corruption; it does not catch this class of subtle corruption. Worth adding a CRC32 (or similar) per entry in a future pass.
+- **Dedup state does not survive a crash** (Design Choice 3 / Q5): a stale client retry landing after a restart can overwrite a different client's newer write. Accepted and understood, not fixed, for this milestone — revisit if it ever needs to be closed (would require WAL entries to carry client_id/request_id and replay to reconstruct dedup.Table too, not just store.Store).
+- **No batching/throttling of fsync**: every write pays a full fsync round-trip. No measured throughput need yet to justify the added complexity.
+- Crash-consistency at the level `fsync` actually protects against (power loss, kernel panic) remains genuinely untested by this project's test suite, and can't be with process-kill-based tools alone — a documented limitation, not an oversight.
+
+---
+
 <!-- All future entries go below this line, in chronological order -->

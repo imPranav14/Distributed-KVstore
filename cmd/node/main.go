@@ -1,8 +1,10 @@
 // Command node is the entry point for a single KV store node. As of
-// Milestone 3, it serves real KV requests over gRPC against its own local
-// store — no replication or consensus yet (Milestones 5-7), so each node is
-// independent of its peers for now even though PEER_ADDRS is already read
-// from config.
+// Milestone 4, every write is durably recorded to a write-ahead log before
+// being applied, and a restarted node replays that log to rebuild its exact
+// prior state before it starts accepting requests — this node now actually
+// survives a crash, not just a graceful shutdown. Still no replication or
+// consensus (Milestones 5-7), so each node is independent of its peers for
+// now even though PEER_ADDRS is already read from config.
 package main
 
 import (
@@ -11,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"google.golang.org/grpc"
@@ -19,8 +22,36 @@ import (
 	"github.com/imPranav14/Distributed-KVstore/internal/dedup"
 	"github.com/imPranav14/Distributed-KVstore/internal/server"
 	"github.com/imPranav14/Distributed-KVstore/internal/store"
+	"github.com/imPranav14/Distributed-KVstore/internal/wal"
 	kvpb "github.com/imPranav14/Distributed-KVstore/proto/kv"
 )
+
+// replayWAL rebuilds a Store's state from every entry previously recorded
+// in w, in order. It must run to completion BEFORE the gRPC server starts
+// accepting requests — serving a request against a store that hasn't
+// finished recovering could return stale or missing data. Every Op value
+// here is guaranteed valid (OpPut or OpDelete) because wal.DecodeEntry
+// already rejected anything else during ReadAll — no default case needed
+// for a state that can't occur.
+func replayWAL(w *wal.WAL) (*store.Store, error) {
+	entries, err := w.ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("main: failed to read WAL for replay: %w", err)
+	}
+
+	s := store.NewStore()
+	for _, entry := range entries {
+		switch entry.Op {
+		case wal.OpPut:
+			s.Put(entry.Key, entry.Value)
+		case wal.OpDelete:
+			s.Delete(entry.Key)
+		}
+	}
+
+	slog.Info("node: replayed WAL", "entries_replayed", len(entries))
+	return s, nil
+}
 
 func main() {
 	cfg, err := config.Load()
@@ -38,13 +69,39 @@ func main() {
 		"data_dir", cfg.DataDir,
 	)
 
+	// DataDir may not exist yet on a brand-new node (fresh docker volume,
+	// fresh local run) — os.OpenFile's O_CREATE only creates the WAL file
+	// itself, not missing parent directories.
+	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+		slog.Error("node: failed to create data directory", "data_dir", cfg.DataDir, "error", err)
+		os.Exit(1)
+	}
+
+	walPath := filepath.Join(cfg.DataDir, "wal.log")
+	w, err := wal.Open(walPath)
+	if err != nil {
+		slog.Error("node: failed to open WAL", "path", walPath, "error", err)
+		os.Exit(1)
+	}
+
+	recoveredStore, err := replayWAL(w)
+	if err != nil {
+		slog.Error("node: failed to replay WAL", "error", err)
+		os.Exit(1)
+	}
+
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
 	if err != nil {
 		slog.Error("node: failed to listen", "grpc_port", cfg.GRPCPort, "error", err)
 		os.Exit(1)
 	}
 
-	kvServer := server.NewKVServer(store.NewStore(), dedup.NewTable())
+	// dedup.NewTable() is deliberately fresh, not reconstructed from the
+	// WAL: dedup state is an accepted, named gap across restarts (see
+	// UNDERSTANDING.md's Milestone 4 entry) — PUT/DELETE are naturally
+	// idempotent, so a client retry landing after a restart just reapplies
+	// the same value rather than corrupting anything.
+	kvServer := server.NewKVServer(recoveredStore, dedup.NewTable(), w)
 	grpcServer := grpc.NewServer()
 	kvpb.RegisterKVStoreServer(grpcServer, kvServer)
 
@@ -71,4 +128,8 @@ func main() {
 	// mid-request, then closes the listener, which is what makes the Serve
 	// goroutine above return.
 	grpcServer.GracefulStop()
+
+	if err := w.Close(); err != nil {
+		slog.Error("node: failed to close WAL", "error", err)
+	}
 }

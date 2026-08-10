@@ -2,21 +2,29 @@ package server
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
 	"github.com/imPranav14/Distributed-KVstore/internal/dedup"
 	"github.com/imPranav14/Distributed-KVstore/internal/store"
+	"github.com/imPranav14/Distributed-KVstore/internal/wal"
 	kvpb "github.com/imPranav14/Distributed-KVstore/proto/kv"
 )
 
-func newTestServer() *KVServer {
-	return NewKVServer(store.NewStore(), dedup.NewTable())
+func newTestServer(t *testing.T) *KVServer {
+	t.Helper()
+	w, err := wal.Open(filepath.Join(t.TempDir(), "wal.log"))
+	if err != nil {
+		t.Fatalf("failed to open test WAL: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	return NewKVServer(store.NewStore(), dedup.NewTable(), w)
 }
 
 // This test checks the invariant that Get correctly translates store.Get's
 // (value, found) result into a GetResponse for a key that was never set.
 func TestGet_MissingKey_ReturnsNotFound(t *testing.T) {
-	s := newTestServer()
+	s := newTestServer(t)
 
 	resp, err := s.Get(context.Background(), &kvpb.GetRequest{Key: "missing"})
 
@@ -32,7 +40,7 @@ func TestGet_MissingKey_ReturnsNotFound(t *testing.T) {
 // store.Put — a value written via the gRPC handler must be visible to a
 // subsequent Get through the same handler.
 func TestPutThenGet_ValueVisible(t *testing.T) {
-	s := newTestServer()
+	s := newTestServer(t)
 	ctx := context.Background()
 
 	_, err := s.Put(ctx, &kvpb.PutRequest{Key: "x", Value: "5", ClientId: "c1", RequestId: 1})
@@ -55,7 +63,7 @@ func TestPutThenGet_ValueVisible(t *testing.T) {
 // and passes the fields through correctly. A retried request (same
 // ClientId/RequestId, different Value) must not overwrite the original.
 func TestPut_DuplicateRequestID_NotReapplied(t *testing.T) {
-	s := newTestServer()
+	s := newTestServer(t)
 	ctx := context.Background()
 
 	if _, err := s.Put(ctx, &kvpb.PutRequest{Key: "x", Value: "first", ClientId: "c1", RequestId: 1}); err != nil {
@@ -77,7 +85,7 @@ func TestPut_DuplicateRequestID_NotReapplied(t *testing.T) {
 // This test checks the invariant that Delete is correctly wired through to
 // store.Delete.
 func TestDelete_RemovesKey(t *testing.T) {
-	s := newTestServer()
+	s := newTestServer(t)
 	ctx := context.Background()
 
 	if _, err := s.Put(ctx, &kvpb.PutRequest{Key: "x", Value: "5", ClientId: "c1", RequestId: 1}); err != nil {
@@ -101,7 +109,7 @@ func TestDelete_RemovesKey(t *testing.T) {
 // (harmless here since Delete is naturally idempotent, but proves the
 // wiring, not just Store's own idempotency).
 func TestDelete_DuplicateRequestID_NotReapplied(t *testing.T) {
-	s := newTestServer()
+	s := newTestServer(t)
 	ctx := context.Background()
 
 	if _, err := s.Put(ctx, &kvpb.PutRequest{Key: "x", Value: "5", ClientId: "c1", RequestId: 1}); err != nil {

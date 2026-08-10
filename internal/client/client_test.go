@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"net"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/imPranav14/Distributed-KVstore/internal/dedup"
 	"github.com/imPranav14/Distributed-KVstore/internal/server"
 	"github.com/imPranav14/Distributed-KVstore/internal/store"
+	"github.com/imPranav14/Distributed-KVstore/internal/wal"
 	kvpb "github.com/imPranav14/Distributed-KVstore/proto/kv"
 )
 
@@ -42,12 +44,18 @@ func startTestServerWithInterceptor(t *testing.T, interceptor grpc.UnaryServerIn
 		t.Fatalf("failed to listen: %v", err)
 	}
 
+	w, err := wal.Open(filepath.Join(t.TempDir(), "wal.log"))
+	if err != nil {
+		t.Fatalf("failed to open test WAL: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+
 	var opts []grpc.ServerOption
 	if interceptor != nil {
 		opts = append(opts, grpc.UnaryInterceptor(interceptor))
 	}
 	grpcServer := grpc.NewServer(opts...)
-	kvServer := server.NewKVServer(store.NewStore(), dedup.NewTable())
+	kvServer := server.NewKVServer(store.NewStore(), dedup.NewTable(), w)
 	kvpb.RegisterKVStoreServer(grpcServer, kvServer)
 
 	go func() {

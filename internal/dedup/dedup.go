@@ -43,9 +43,16 @@ func NewTable() *Table {
 // If requestID has already been processed for this client — either it's an
 // exact retry of the most recent request, or it's an even older, stale
 // retry the client has already moved on from — Execute returns
-// wasDuplicate=true without calling applyFn. Otherwise it calls applyFn and
-// records requestID as the latest seen for this client, then returns
-// wasDuplicate=false.
+// wasDuplicate=true without calling applyFn. Otherwise it calls applyFn.
+//
+// INVARIANT: requestID is recorded as seen ONLY if applyFn succeeds (returns
+// a nil error). If applyFn fails — e.g. Milestone 4's WAL write hitting a
+// disk error — this request must remain retryable: the operation never
+// actually happened, so a client resending the same requestID must be
+// treated as fresh work next time, not silently swallowed as "already
+// handled." Recording lastSeen on a failed attempt would make a failed
+// write permanently unretryable, which is a correctness bug, not a
+// performance one.
 //
 // INVARIANT: applyFn runs while mu is held. This is what closes the race
 // window that would otherwise exist if callers had to call a separate
@@ -55,12 +62,12 @@ func NewTable() *Table {
 // makes "check" and "apply and record" a single atomic step.
 //
 // Because of this, applyFn MUST be fast (it will just be a thin call into
-// store.Put or store.Delete) and MUST NOT call back into this same Table —
-// Go's sync.Mutex is not reentrant, so that would deadlock every time, not
-// intermittently. Lock ordering elsewhere in the codebase must always
-// acquire this Table's lock before store.Store's lock, never the reverse,
-// to avoid a lock-ordering cycle between the two.
-func (t *Table) Execute(clientID ClientID, requestID RequestID, applyFn func()) (wasDuplicate bool) {
+// store.Put/Delete plus a wal.Append) and MUST NOT call back into this same
+// Table — Go's sync.Mutex is not reentrant, so that would deadlock every
+// time, not intermittently. Lock ordering elsewhere in the codebase must
+// always acquire this Table's lock before store.Store's lock, never the
+// reverse, to avoid a lock-ordering cycle between the two.
+func (t *Table) Execute(clientID ClientID, requestID RequestID, applyFn func() error) (wasDuplicate bool, err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -70,10 +77,13 @@ func (t *Table) Execute(clientID ClientID, requestID RequestID, applyFn func()) 
 		// before the client's most recent request — a correctly-behaving
 		// client would never still be waiting on it, so it's safe to
 		// silently ignore.
-		return true
+		return true, nil
 	}
 
-	applyFn()
+	if err := applyFn(); err != nil {
+		return false, err
+	}
+
 	t.lastSeen[clientID] = requestID
-	return false
+	return false, nil
 }
