@@ -3,7 +3,7 @@ services:
     build: .
     environment:
       - NODE_ID=1
-      - PEER_ADDRS=node2:50051,node3:50051
+      - PEER_ADDRS=2=node2:50051,3=node3:50051
       - GRPC_PORT=50051
       - DATA_DIR=/data/node1
     volumes:
@@ -13,7 +13,7 @@ services:
     build: .
     environment:
       - NODE_ID=2
-      - PEER_ADDRS=node1:50051,node3:50051
+      - PEER_ADDRS=1=node1:50051,3=node3:50051
       - GRPC_PORT=50051
       - DATA_DIR=/data/node2
     volumes:
@@ -23,7 +23,7 @@ services:
     build: .
     environment:
       - NODE_ID=3
-      - PEER_ADDRS=node1:50051,node2:50051
+      - PEER_ADDRS=1=node1:50051,2=node2:50051
       - GRPC_PORT=50051
       - DATA_DIR=/data/node3
     volumes:

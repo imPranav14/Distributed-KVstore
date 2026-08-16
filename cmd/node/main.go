@@ -1,10 +1,10 @@
 // Command node is the entry point for a single KV store node. As of
-// Milestone 4, every write is durably recorded to a write-ahead log before
-// being applied, and a restarted node replays that log to rebuild its exact
-// prior state before it starts accepting requests — this node now actually
-// survives a crash, not just a graceful shutdown. Still no replication or
-// consensus (Milestones 5-7), so each node is independent of its peers for
-// now even though PEER_ADDRS is already read from config.
+// Milestone 5, nodes actually talk to each other: each one runs Raft leader
+// election against its peers (terms, randomized timeouts, RequestVote,
+// heartbeats) and the cluster elects — and, if the leader disappears,
+// re-elects — a single leader. Log replication and routing client writes
+// through consensus are still Milestone 6/7; a node accepts KV requests
+// against its own local state regardless of its Raft role for now.
 package main
 
 import (
@@ -20,10 +20,12 @@ import (
 
 	"github.com/imPranav14/Distributed-KVstore/internal/config"
 	"github.com/imPranav14/Distributed-KVstore/internal/dedup"
+	"github.com/imPranav14/Distributed-KVstore/internal/raft"
 	"github.com/imPranav14/Distributed-KVstore/internal/server"
 	"github.com/imPranav14/Distributed-KVstore/internal/store"
 	"github.com/imPranav14/Distributed-KVstore/internal/wal"
 	kvpb "github.com/imPranav14/Distributed-KVstore/proto/kv"
+	raftpb "github.com/imPranav14/Distributed-KVstore/proto/raft"
 )
 
 // replayWAL rebuilds a Store's state from every entry previously recorded
@@ -90,6 +92,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	raftStatePath := filepath.Join(cfg.DataDir, "raft-state.dat")
+	raftState, err := raft.LoadState(raftStatePath)
+	if err != nil {
+		slog.Error("node: failed to load raft state", "path", raftStatePath, "error", err)
+		os.Exit(1)
+	}
+
+	// Dialing is lazy (see raftPeerClient's doc comment) — this doesn't
+	// block waiting for peers to be up, which matters since docker-compose
+	// starts all three containers at roughly the same time and none of
+	// them are guaranteed to be listening yet.
+	peers := make(map[uint64]raft.Peer, len(cfg.PeerAddrs))
+	for peerID, addr := range cfg.PeerAddrs {
+		peerClient, err := server.NewRaftPeerClient(addr)
+		if err != nil {
+			slog.Error("node: failed to create raft peer client", "peer_id", peerID, "addr", addr, "error", err)
+			os.Exit(1)
+		}
+		peers[peerID] = peerClient
+	}
+
+	raftNode := raft.NewNode(uint64(cfg.NodeID), raftState, peers)
+
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
 	if err != nil {
 		slog.Error("node: failed to listen", "grpc_port", cfg.GRPCPort, "error", err)
@@ -102,8 +127,11 @@ func main() {
 	// idempotent, so a client retry landing after a restart just reapplies
 	// the same value rather than corrupting anything.
 	kvServer := server.NewKVServer(recoveredStore, dedup.NewTable(), w)
+	raftServer := server.NewRaftServer(raftNode)
+
 	grpcServer := grpc.NewServer()
 	kvpb.RegisterKVStoreServer(grpcServer, kvServer)
+	raftpb.RegisterRaftServer(grpcServer, raftServer) // same server, same port as KVStore
 
 	// This goroutine's exit condition is grpcServer.GracefulStop() below,
 	// called once a shutdown signal is received — Serve returns once
@@ -113,7 +141,11 @@ func main() {
 			slog.Error("node: grpc server stopped unexpectedly", "error", err)
 		}
 	}()
-	slog.Info("node: serving KVStore", "addr", listener.Addr().String())
+	slog.Info("node: serving KVStore and Raft", "addr", listener.Addr().String())
+
+	// raftNode.run()'s exit condition is raftNode.Stop() below, on
+	// shutdown — same Rule 5 pattern as the gRPC Serve goroutine above.
+	raftNode.Start()
 
 	// Block here until the process receives SIGINT (Ctrl+C) or SIGTERM
 	// (sent by `docker compose stop` / `make kill1`). Without this, main()
@@ -124,6 +156,7 @@ func main() {
 	receivedSignal := <-shutdownSignal
 
 	slog.Info("node: shutting down", "signal", receivedSignal.String())
+	raftNode.Stop()
 	// GracefulStop lets any in-flight RPC finish instead of cutting it off
 	// mid-request, then closes the listener, which is what makes the Serve
 	// goroutine above return.

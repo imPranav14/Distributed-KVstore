@@ -728,4 +728,225 @@ This is the concrete instance of the risk this milestone's concept brief flagged
 
 ---
 
+## Milestone 5 — Raft Leader Election
+Date: 2026-08-15
+
+### The Problem This Solves
+Through Milestone 4 we had three separate, durable, single-node KV stores
+that shared a docker-compose.yml and knew each other's addresses via an env
+var nothing had ever read for its intended purpose. Not a distributed
+system: a write to node1 landed only on node1, and killing node1 lost both
+the data and the service.
+
+The naive fix — every node forwards writes to every other — fails
+immediately. Two concurrent writes to the same key applied in different
+orders on different nodes leave replicas permanently disagreeing with no
+authority to appeal to. The fix is to funnel all writes through a single
+leader that assigns a definitive order. But that just relocates the
+problem: who is the leader, and what happens when it dies? Designating one
+permanently isn't fault tolerance, it's a single point of failure with two
+idle backups.
+
+Leader election is hard because of the fundamental constraint of
+distributed systems: a node cannot distinguish "the leader crashed" from
+"the network to the leader is slow." Both look like silence. If nodes react
+to silence by promoting themselves, you get split brain.
+
+Split into 5a (proto + persistent state), 5b (roles, terms, timers,
+RequestVote — testable in-process), 5c (gRPC wiring + a real 3-container
+cluster), matching the pattern from Milestones 3 and 4.
+
+### The Design Decision Made
+**Election timer: ticker loop over resettable time.Timer.** A goroutine
+ticks every 10ms and checks `time.Since(lastHeartbeat) > electionTimeout`.
+Less "elegant" than a `time.Timer` with `Reset`, but `Timer.Reset` has
+genuinely subtle semantics (a fired timer may have a value sitting in its
+channel; getting the drain-before-reset pattern wrong is a classic
+hard-to-reproduce Go bug). Rule 3 favors the version a reader can verify by
+eye, and the wasted CPU is irrelevant at 3 nodes.
+
+**Persistent state in its own file, not the KV WAL.** `raft-state.dat` in
+DATA_DIR, rewritten whole and fsynced on every change. Reusing the WAL
+would make `wal.ReadAll` return a mix of KV operations and Raft metadata,
+coupling two things that change for entirely different reasons.
+
+**Atomic replacement (temp file + rename + directory fsync) rather than an
+in-place 16-byte rewrite.** Presented as a genuinely optional call —
+a 16-byte single-sector write is very likely atomic in practice, and plenty
+of production code would rewrite in place. Chose the portable-correct
+version because POSIX doesn't guarantee it and the failure it prevents is
+precisely the double-vote bug. Break 2 below demonstrates why detection
+can't substitute for prevention here.
+
+**Carry `last_log_index`/`last_log_term` in RequestVote now**, vacuously
+(always 0), even though the log doesn't exist until Milestone 6. Costs
+nothing and avoids reopening the RPC signature next milestone.
+
+**`Peer` interface mirrors the two gRPC methods exactly.** Unlike
+kv_server.go, which translates wire types into meaningfully different
+domain concepts, Raft's own concepts — term, candidate, vote granted — ARE
+the domain model. There is nothing simpler to translate into. The payoff:
+`internal/raft` never imports gRPC (verified — the real network client
+lives in `internal/server`), and every election test runs in-process with
+fake Peers calling directly into other Nodes' handlers.
+
+**`PEER_ADDRS` format changed** from `node2:50051,node3:50051` to
+`2=node2:50051,3=node3:50051`. `raft.Node`'s peers are keyed by node ID
+because RequestVote/AppendEntries need to know WHICH node an address
+belongs to. Inferring IDs from hostnames would have been a fragile hack
+depending on a naming convention holding forever. This also gave
+`internal/config` its first real parsing logic, and therefore its first
+test file (it never got one during Milestone 0's lighter pass).
+
+### How It Works — Plain English
+Time is divided into numbered terms, each with at most one leader —
+possibly zero, if an election fails. Every RPC carries a term. The rule
+that makes this work: any node that sees a term higher than its own
+immediately adopts it and reverts to follower. That single rule is how a
+stale leader returning from a partition discovers it was replaced — there
+is no "you're fired" message, it just learns from the next RPC it happens
+to receive.
+
+Every node starts as a follower. A follower that hasn't heard from a leader
+within its (randomized) election timeout assumes the leader is dead:
+increments its term, becomes a candidate, votes for itself, and asks
+everyone for votes. A majority wins. Two rules together guarantee at most
+one leader per term — each node votes at most once per term, and winning
+requires a majority — because any two majorities of the same set share at
+least one member, and that member cannot have voted twice. A leader sends
+empty AppendEntries (heartbeats) on a fast interval to stop anyone else
+from campaigning.
+
+Randomization is what makes elections terminate. Identical timeouts mean
+all nodes time out together, all campaign together, all split the vote, and
+nobody ever wins — demonstrated empirically in Break 1.
+
+### Key Invariants
+- INVARIANT (`state.go`): `currentTerm` and `votedFor` are always written
+  together as one logical fact, never independently — a setter that could
+  bump the term without clearing the vote would let a stale vote from an
+  old term apply to a new one.
+- INVARIANT (`state.go`): disk is updated durably BEFORE memory. A failed
+  `Save` returns an error without touching in-memory fields — a node that
+  believes it voted with no durable record of it can vote twice after a
+  restart.
+- INVARIANT (`node.go`): entering a new term always clears any prior vote
+  (`Save(term, NoVote)` in `becomeFollowerLocked`).
+- INVARIANT (`node.go`): the election timeout is re-randomized on every
+  reset, not chosen once at startup.
+- INVARIANT (`election.go`): a vote is persisted before the RequestVote
+  response is sent; if persistence fails, the vote is refused rather than
+  granted.
+- INVARIANT (`election.go`): a majority counted against a stale election
+  must be discarded — re-validated on every single vote response, not once
+  at the start.
+
+### The Lines That Matter Most
+
+Line: `if req.Term > n.state.CurrentTerm() { n.becomeFollowerLocked(req.Term) }` — first, unconditionally, in BOTH handlers
+Does: adopts any higher term and reverts to follower before any other logic runs.
+Breaks without it: this is the entire mechanism by which a stale leader or candidate learns it has been superseded. Skip it, or run it after other checks, and a stale leader keeps heartbeating (and from Milestone 7, accepting writes) indefinitely.
+Why this way: term adoption is not something other logic gets to see conditionally — it runs first, in both handlers, no exceptions.
+
+Line: `stillRelevant := n.role == Candidate && n.state.CurrentTerm() == electionTerm`
+Does: re-validates, for every vote response, that the election it belongs to is still the one in progress.
+Breaks without it: a candidate can step down or move to a later term while vote-counting goroutines from an earlier election are still in flight. Without this, a majority collected for term 5 could set `role = Leader` while `currentTerm` is already 7 — a leader of term 7 that never won term 7, coexisting with the legitimate one. Note the term half is load-bearing: after stepping down and starting a NEW election, the role check alone passes (`Candidate` again) and only the term comparison catches it.
+Why this way: checked fresh on every response, because the world can change between when the election started and when each individual response arrives.
+
+Line: `n.electionTimeout = electionTimeoutMin + time.Duration(rand.Int64N(span))`
+Does: rolls a fresh random timeout on every reset.
+Breaks without it: proven in Break 1 — ~20% of runs livelock with no leader ever elected.
+Why re-rolled every time rather than once at startup: a one-time draw freezes each node's timeout forever, so two nodes whose initial draws landed close together would collide on every subsequent election involving both.
+
+Line: `os.CreateTemp` → `Write` → `Sync` → `Close` → `os.Rename` → open dir → `Sync` dir
+Does: makes the state update all-or-nothing and durable.
+Breaks without it: Break 2 showed that a torn mix of new term + old vote is silently ACCEPTED by `LoadState` — the structural size check can't detect it. The protection is in preventing the bad state, not detecting it.
+Why the directory fsync specifically: `rename` changes directory metadata, not file contents. Without fsyncing the directory, a crash right after the rename can lose the rename even though the temp file's bytes are safely on disk. This is the step people forget.
+
+Line: `else if n.role == Candidate { n.role = Follower }` in `HandleAppendEntries` (same-term branch)
+Does: steps a losing candidate down without touching the term or calling `becomeFollowerLocked`.
+Breaks without it: a candidate that lost would keep re-campaigning on its own timeout, contesting terms indefinitely even while a legitimate leader heartbeats successfully.
+Why not `becomeFollowerLocked`: that persists a `Save` clearing the vote — but this node validly voted for itself in this exact term, and that vote needn't be rewritten just because it lost. Using the full transition here would be a wasted disk write.
+
+### What Breaks and Why
+
+**Break 1 — fixed, identical election timeouts (named explicitly by CLAUDE.md)**
+Change: replaced the randomized timeout with a fixed 200ms for every node.
+Prediction: all three time out in the same tick window, all become candidates, all vote for themselves, none reaches a majority — `TestThreeNodeCluster_ElectsExactlyOneLeader` fails with zero leaders ever elected.
+Observed: as predicted, but INTERMITTENTLY — 3 failures in 15 runs (~20%). Go's scheduler introduces just enough jitter between "simultaneous" ticks to occasionally break the tie by luck. Same lesson as Milestone 4's mutex break: a bug that only manifests 20% of the time is more dangerous than one that always fails, because it survives casual testing.
+Why wrong at a deep level: this is a LIVENESS failure, not a safety one — nothing was corrupted, no invariant violated, the cluster simply never made progress. Real Raft deployments have had multi-second outages from exactly this. Randomization isn't an optimization; it's what makes the algorithm terminate at all.
+
+**Break 2 — in-place rewrite instead of atomic replacement (demonstrated indirectly)**
+Change: hand-constructed a 16-byte state file containing a NEW term (99) paired with an OLD `votedFor` (7) — exactly what an interrupted in-place write leaves behind.
+Prediction: `LoadState` accepts it, since the size check passes.
+Observed: confirmed — accepted with zero error, returning internally inconsistent state.
+Why wrong at a deep level: the same blind spot found in Milestone 4's Q3 (structural validation catches gross corruption, not subtle content-level inconsistency) — but here it matters more, because this specific inconsistency IS the shape of the double-vote bug. The lesson: atomic rename doesn't help `LoadState` detect the bad state, it guarantees the bad state can never exist on disk. Prevention, not detection.
+
+**Break 1b — memory updated before disk in `Save`**
+Change: moved the in-memory field assignment above the disk operations.
+Prediction: a forced disk failure leaves memory claiming a vote that was never persisted.
+Observed: as predicted — memory showed term=2/votedFor=2 with the write having failed entirely. `TestSave_DiskFailure_DoesNotUpdateMemory` was written for this break and kept permanently.
+
+**Deferred, not skipped — "remove the stale-log check in RequestVote"** (CLAUDE.md's second named break for this milestone). Verified rather than assumed: `candidateLogIsUpToDate` is currently hardcoded `true`, because `last_log_index`/`last_log_term` are always 0 on both sides until Milestone 6 gives nodes an actual log. There is no comparison to weaken. Flipping it to `false` would prove nothing useful — it would just make every election visibly fail, not demonstrate the subtle safety violation the check exists to prevent (electing a leader missing committed entries), which cannot exist in a system with no log. Deferred to Milestone 6 where it can be run honestly.
+
+### Real Cluster Verification (5c)
+Ran an actual 3-container docker-compose cluster, not a simulation:
+- **Startup:** several terms cycled before settling (node3 briefly won term 2, then correctly stepped down when node2 won term 3) — messy but correct; different terms, not a safety violation. Then logs went silent, proving heartbeats were suppressing further elections. Confirmed stable: identical log-line count across a 5-second window.
+- **Leader failure:** `docker compose stop node2` → node1 campaigned at term 4, won with 2 votes, node3 followed. Re-election in well under a second.
+- **Persistent state inspected on disk:** `raft-state.dat` is exactly 16 bytes; the leader's file showed it had voted for itself, followers' files showed them voting for the leader, all at the same term.
+- **Unplanned finding — the disruptive rejoin:** reviving node2 deposed node1, a perfectly healthy leader. Node2's persisted term made it campaign before hearing node1's heartbeat; term 5 > term 4 forced node1 to step down by the Term Rule. Correct per the rules of basic Raft, and a well-documented liveness limitation of the paper's algorithm — production systems add PreVote specifically to prevent it. Not built here; named as a real gap rather than discovered by accident.
+
+Also fixed during this step: the Dockerfile pinned `golang:1.22` while `go.mod` had been bumped to `1.25.0` as a side effect of Milestone 3's `go get`. Flagged as low-risk at the time; this is where it actually broke the build.
+
+### Interview Questions and Answers
+
+Q1: Can two nodes simultaneously believe they are leader? If so, why isn't that a correctness problem, and what would make it one?
+A: Yes, in different terms; Raft guarantees at most one leader per term; it's a violation if two leaders exist in the same term.
+Assessment: correct, but thin.
+What was missing: the mechanism (a stale leader is harmless because every action requiring a majority is rejected by nodes at the higher term, so from M6 it can never commit anything), and the actual answer to "what would make it dangerous" — a leader acting unilaterally without majority confirmation, concretely the Milestone 7 stale-read problem, which is a READ path issue rather than a write path one.
+
+Q2: 5-node cluster, A leader at term 7, partition into {A,B} and {C,D,E}. What happens on each side, what is B's term after 5 minutes, and what happens on heal?
+A: A stays leader at term 7 but can't get a majority; {C,D,E} elects a leader at term 8; B stays at term 7 because it still hears A; on heal A sees term 8 and steps down.
+Assessment: strong — correctly resisted a leading question.
+The question's framing ("give me a rough number" for B's term) implied it climbs. It doesn't: B is partitioned WITH A, receives A's heartbeats, and its election timer never fires. The scenario that produces unbounded term inflation is a LONE-node partition ({A,B,C,D} | {E}), where E campaigns and fails repeatedly — the canonical motivation for PreVote, and the amplified version of the disruptive rejoin observed in Docker.
+
+Q3: Construct the interleaving where moving the fsync after the RPC response produces two leaders in the same term.
+A: Stated the rule correctly (persist before responding; otherwise a crash loses the vote and the node can vote again in the same term).
+Assessment: correct principle, but did not construct the interleaving as asked.
+What was missing: the concrete sequence. A campaigns for term 5; its request to B is delayed; C grants and responds immediately with fsync pending; A reaches majority and becomes leader; C crashes before the fsync lands; C restarts with no record of the vote; B times out, campaigns for term 5, asks C; C grants a SECOND time; B reaches majority. Two leaders in term 5. The crux: the entire safety proof rests on "each node votes at most once per term," and the fsync is the only thing making that true across a crash.
+
+Q4: Design PreVote — request contents, granting criteria, what it must NOT do, and is it safety or liveness?
+A: Ask "would you vote for me?" before a real election; must not increase the real term or cause step-down; prevents disrupting healthy leaders; liveness fix — as was the fixed-timeout break.
+Assessment: strong.
+What was missing: the granting criteria specifically — a peer grants a pre-vote only if (a) it has NOT heard from a current leader within its own election timeout, and (b) the candidate's log is at least as up-to-date. Condition (a) is the whole mechanism: in the observed rejoin, node1 and node3 WERE hearing healthy heartbeats, so they'd refuse, node2 would never bump its term, and node1 would never step down. The disruption is prevented at the responder, not by restraint on the rejoining node's part.
+
+Q5: I claim the `stillRelevant` check is dead code, because votes are conserved — nobody else could win term 5 if you collected a majority for term 5. Am I right?
+A: Not dead code. While waiting for votes, another goroutine can receive a higher-term RPC, making the node a follower in term 6 while the election was for term 5; without the check the stale election could still make it leader, producing two leaders in term 6.
+Assessment: strong — correctly rejected the argument.
+What could be sharpened: the vote-conservation argument is TRUE but answers the wrong question — it proves nobody else won term 5, while the danger is becoming leader while currently IN term 6/7 having never won it. Also worth noting the two halves of the check aren't redundant: after stepping down and starting a new election, the node is `Candidate` again, so the role check passes and only the term comparison catches the stale result.
+
+Overall: 3 strong, 2 needing depth. Conceptual grasp is solid throughout; the gap is giving the rule where the question asked for the mechanism or the concrete construction (Q1, Q3).
+
+### Git Commit Message
+`feat: add Raft leader election with terms, randomized timeouts, and heartbeats`
+
+### Open Questions
+- **No PreVote** — a restarting or reconnecting node can depose a healthy
+  leader purely by having a higher persisted term. Observed live in Docker.
+  A known limitation of basic Raft; production systems fix it with a
+  pre-vote round. Out of scope for this milestone's roadmap entry.
+- **No status/admin RPC** — the only way to observe a node's role is
+  reading its logs. A real observability gap; a candidate for Milestone 10.
+- **KV service isn't reachable from the host** — `docker-compose.yml` has
+  no `ports:` mappings, so the containerized cluster can only be reached
+  from inside the Docker network. Becomes genuinely necessary at Milestone
+  7 when client writes must route to the leader.
+- **Raft roles have no effect on KV requests yet** — a node serves
+  PUT/GET/DELETE against its own local state regardless of whether it is
+  leader or follower. That wiring is exactly Milestone 7.
+- **Stale-log check in RequestVote is vacuous** and its break-it exercise
+  is deferred to Milestone 6, when the log exists to make it real.
+
+---
+
 <!-- All future entries go below this line, in chronological order -->

@@ -1,7 +1,7 @@
 # Build stage: compile a static Go binary. Using a full Go image here (not
 # the final runtime image) keeps the shipped container small and avoids
 # bundling the Go toolchain into every node's image.
-FROM golang:1.22 AS build
+FROM golang:1.25 AS build
 WORKDIR /src
 
 COPY go.mod go.sum* ./

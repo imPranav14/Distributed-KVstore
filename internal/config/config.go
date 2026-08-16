@@ -23,10 +23,13 @@ type Config struct {
 	// authored which log entry.
 	NodeID int
 
-	// PeerAddrs lists the host:port of every OTHER node in the cluster
-	// (not including this node itself). Populated by splitting PEER_ADDRS
-	// on commas, e.g. "node2:50051,node3:50051" -> ["node2:50051", "node3:50051"].
-	PeerAddrs []string
+	// PeerAddrs maps every OTHER node's ID to its host:port (not including
+	// this node itself). Populated from PEER_ADDRS, e.g.
+	// "2=node2:50051,3=node3:50051" -> {2: "node2:50051", 3: "node3:50051"}.
+	// Keyed by ID, not just a bare address list, because raft.Node's peers
+	// are looked up by node ID — RequestVote/AppendEntries need to know
+	// WHICH node an address belongs to, not just that it exists.
+	PeerAddrs map[uint64]string
 
 	// GRPCPort is the TCP port this node's gRPC server listens on.
 	GRPCPort int
@@ -69,9 +72,19 @@ func Load() (*Config, error) {
 	// for local testing), so we only split on commas — we don't error on
 	// an empty string. strings.Split("", ",") would return [""] (one empty
 	// element, not zero elements), so we guard that case explicitly.
-	var peerAddrs []string
+	peerAddrs := make(map[uint64]string)
 	if raw := os.Getenv("PEER_ADDRS"); raw != "" {
-		peerAddrs = strings.Split(raw, ",")
+		for _, entry := range strings.Split(raw, ",") {
+			idAndAddr := strings.SplitN(entry, "=", 2)
+			if len(idAndAddr) != 2 {
+				return nil, fmt.Errorf("config: PEER_ADDRS entry %q is not in ID=address form", entry)
+			}
+			peerID, err := strconv.ParseUint(idAndAddr[0], 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("config: PEER_ADDRS entry %q has a non-integer ID: %w", entry, err)
+			}
+			peerAddrs[peerID] = idAndAddr[1]
+		}
 	}
 
 	return &Config{
