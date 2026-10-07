@@ -949,4 +949,249 @@ Overall: 3 strong, 2 needing depth. Conceptual grasp is solid throughout; the ga
 
 ---
 
+## Milestone 6 — Raft Log Replication
+Date: 2026-10-07
+
+### The Problem This Solves
+Milestone 5 produced a cluster that elects a leader and then does nothing
+with its leadership. This milestone builds what leadership is for: getting
+every node's log to agree on the same sequence of commands in the same
+order.
+
+"Just send each new entry to everyone" fails three distinct ways, and each
+one motivates a specific mechanism:
+1. **Followers miss entries** (down, partitioned) and end up with holes in
+   a log where position N is supposed to mean something. → `nextIndex`
+   backtracking ships everything a follower is missing.
+2. **Followers hold wrong entries** written by a since-deposed leader that
+   never replicated them. Those must be detected and destroyed: the
+   cluster's truth is whatever the current leader says. → the
+   `prevLogIndex`/`prevLogTerm` consistency check plus conflict truncation.
+3. **"Written somewhere" is not "safe."** An entry only the leader holds
+   vanishes if the leader dies. → `commitIndex`: replicated on a majority,
+   therefore guaranteed to survive any future election — with the Figure 8
+   exception, below.
+
+Split into 6a (the durable log + making the election restriction real),
+6b (follower-side `AppendEntries`), 6c (leader-side `nextIndex`/
+`matchIndex`, backtracking, `commitIndex`).
+
+### The Design Decision Made
+**Raft log is new code in `internal/raft`, not a second `wal.WAL`.** The
+Raft log must delete a conflicting suffix; `wal.WAL` is append-only by
+contract, and its torn-tail tolerance in `ReadAll` was designed around that
+assumption. A functional difference, not a stylistic one. Alternatives
+rejected: extending `internal/wal` with truncation (bends a package whose
+whole contract is "append-only"), and rewriting the whole file on every
+change like `state.go` (correct, but O(n) per append).
+
+**1-indexed per the paper**, with index 0 as the "before the first entry"
+sentinel so `prevLogIndex = 0` needs no special case. The 0-based-slice
+translation is confined to `log.go`; every exported method takes and
+returns real Raft indices.
+
+**Hand-rolled fixed-layout encoding** (`[8 term][8 index][4 cmdLen][cmd]`)
+rather than `proto.Marshal`, even though `raftpb.LogEntry` is right there:
+protobuf serialization is not canonical — the same message can marshal to
+different bytes across library versions — which is the wrong property for
+a durable log that may later be checksummed or byte-compared.
+
+**Truncation by recorded byte offset** — `offsets[i]` lets `TruncateFrom`
+be one `file.Truncate` syscall instead of a rewrite.
+
+**`commitIndex` is volatile, not persisted**, per the paper. A restarted
+node starts at 0 and re-learns it. Persisting buys nothing (the entries are
+already durable) and an over-eager restored value is strictly more
+dangerous than an under-eager rebuilt one. Q3 below shows the consequence
+this has for leaders — which is the no-op gap.
+
+**`nextIndex` optimistic, `matchIndex` pessimistic.** On election,
+`nextIndex = lastIndex+1` (assume the follower matches; back off on
+rejection) and `matchIndex = 0` (assume nothing until confirmed). Optimism
+on `nextIndex` costs a few wasted round trips; optimism on `matchIndex`
+would let a fresh leader commit entries no follower holds.
+
+**One mechanism for heartbeats and replication.** `sendHeartbeats` was
+replaced by `replicateToAll`: an `AppendEntries` to a caught-up follower
+carries no entries, and that IS the heartbeat.
+
+**Simple decrement-by-one backtracking**, not the paper's conflict-hint
+optimization (follower reports the conflicting term/first index so the
+leader can skip back a whole term at once). Avoided a proto change; noted
+as an open question.
+
+**KV WAL deprecation deferred to Milestone 7.** Once the Raft log is
+durable, the Milestone 4 WAL is redundant — they are the same idea at
+different layers. Removing it now would break M4's working durability
+before its replacement is wired to client writes.
+
+### How It Works — Plain English
+`Log` (log.go) is an ordered, durable list of entries on disk, each carrying
+the term it was created in. On startup it replays the file, stops at a
+partial trailing entry left by a crash, and — unlike the KV WAL — physically
+truncates those partial bytes away, because this log is appended to right
+after recovery and leftover garbage would land between valid entries.
+
+A follower's `HandleAppendEntries` (replication.go) first handles terms as
+in Milestone 5, resets its election timer, then runs the consistency check:
+"do I have an entry at `prevLogIndex` with term `prevLogTerm`?" If not, it
+refuses, and the leader backs up one position and tries again next tick. If
+yes, it walks the incoming entries: an entry it already holds with the same
+term is left alone; an entry at the same index with a *different* term is a
+genuine conflict, so it truncates from there and appends the leader's
+version. It only replies success after the append has been fsynced. Finally
+it raises its `commitIndex` toward the leader's, capped at the last entry
+this request actually delivered.
+
+The leader (`Propose`, `replicateToAll`, `replicateToPeer`) appends new
+commands to its own log stamped with its current term, then on every tick
+ships each follower whatever that follower is missing, based on
+`nextIndex`. On success it records `matchIndex` from exactly what it sent;
+on failure it decrements `nextIndex`. After any success it recomputes
+`commitIndex`: the highest index held by a majority AND belonging to the
+leader's current term.
+
+### Key Invariants
+- INVARIANT (`log.go`): every write and every truncation is fsynced BEFORE
+  the in-memory slice changes — memory is only ever a cache of what is
+  durably on disk.
+- INVARIANT (`log.go`): the Nth entry in the file carries index N; a gap or
+  duplicate is a hard error at load, not a silent stop.
+- INVARIANT (`log.go`, `IsUpToDate`): a later last term always wins; equal
+  terms are broken by length. This is the election restriction, real as of
+  6a.
+- INVARIANT (`replication.go`): the election timer resets BEFORE the
+  consistency check, so a rejected `AppendEntries` from a legitimate leader
+  still suppresses an election.
+- INVARIANT (`replication.go`): an existing entry is deleted ONLY when it has
+  the same index and a DIFFERENT term — never because "I'm about to write
+  here anyway."
+- INVARIANT (`replication.go`): `Success` is returned only after the
+  entries are fsynced.
+- INVARIANT (`replication.go`): a follower's `commitIndex` never exceeds the
+  last entry the current request delivered, and never decreases.
+- INVARIANT (`replication.go`): `matchIndex` is computed from what the
+  acknowledged request contained, not from the leader's current log length.
+- INVARIANT (`replication.go`): an entry is committed by counting replicas
+  ONLY if it is from the leader's current term (Figure 8); earlier entries
+  commit transitively.
+- INVARIANT (`election.go`): `initializeLeaderStateLocked` runs before `mu`
+  is released on winning, so nothing observes `role == Leader` with nil
+  replication maps.
+
+### The Lines That Matter Most
+
+Line: `prevTerm, exists := n.log.TermAt(req.PrevLogIndex); if !exists || prevTerm != req.PrevLogTerm { return ... Success: false }`
+Does: refuses to append unless this log agrees with the leader's at the position just before the new entries.
+Breaks without it: proven in Break 3 — damage at two levels. Logically, the leader recorded `matchIndex=3` for a follower whose log ended at 1 and committed entries existing on one machine. Physically, the follower's log got `Index=6` at slice position 2 and became permanently unloadable: `log entry at offset 21 has index 6, want 2`.
+Why this way: agreement at one position inductively implies agreement at every earlier position (the Log Matching Property), so comparing a single entry verifies the whole prefix.
+
+Line: `if present && existingTerm == newEntry.Term { continue }`
+Does: leaves an entry alone if we already hold exactly it.
+Breaks without it: the network duplicates and reorders RPCs — routinely in this implementation, since the leader sends every 10ms with a 100ms timeout and gRPC serves calls concurrently. A delayed duplicate carrying entries 5-7, arriving after 5-10 were replicated, would wipe out 8-10 under a naive "truncate from prevLogIndex+1" implementation. Q5 traced how that destroys committed data.
+Why this way: truncation must be driven by an actual term mismatch.
+
+Line: `newMatchIndex := prevLogIndex + uint64(len(entries))`
+Does: credits the follower with exactly the entries in the request it acknowledged.
+Breaks without it: Q4's interleaving — a `Propose` lands while the request is in flight, `n.log.LastIndex()` has grown, and the leader credits the follower with an entry it was never sent. In a 3-node cluster that's a majority, and since `Propose` stamps the current term, Figure 8 offers no protection. Verified against a mutant (`matchIndex = 2, want 1`).
+Why this way: `matchIndex` records what has been verified, not what anyone currently holds. The follower's `min(leaderCommit, prevLogIndex+len(entries))` is the same rule from the other side.
+
+Line: `if !ok || termAtIndex != currentTerm { continue }` in `advanceCommitIndexLocked`
+Does: refuses to commit an old-term entry by counting replicas.
+Breaks without it: Figure 8 — an old-term entry sits on a majority and is counted committed, then a later candidate whose last entry came from an intermediate term (a leader that never had it) legitimately wins and overwrites it.
+Why this way: the election restriction compares last terms. Only a current-term entry on a majority raises every holder's last term high enough for that comparison to protect it (Q1).
+
+Line: `if err := l.file.Truncate(l.size); err != nil` at the end of `replayFromDisk`
+Does: physically discards a partial trailing entry at recovery.
+Breaks without it: proven in Break 1 — recovery and the next append both look healthy; the corruption only surfaces on the following restart.
+Why this way: required by the append-after-recovery access pattern, which is precisely what the KV WAL does not have.
+
+### What Breaks and Why
+
+**Break 1 (6a) — partial tail left in place at recovery**
+Change: removed `l.file.Truncate(l.size)` from `replayFromDisk`.
+Prediction: append-after-recovery produces an unreadable log.
+Observed: recovery succeeded, the append succeeded, `LastIndex()` looked right — and the NEXT reopen failed with `log entry at offset 21 has index 33554432, want 2`, the five garbage bytes read as part of entry 2's header.
+Why wrong at a deep level: the bug is silent until the next crash recovery, which is exactly when you can least afford a surprise. A node could run for days on a log it will never be able to reload.
+
+**Break 2 (6a) — election restriction removed (CLAUDE.md's Milestone 5 break, finally real)**
+Change: `candidateLogIsUpToDate := true`.
+Prediction: a voter with real entries grants its vote to a candidate with an empty log.
+Observed: confirmed at unit level during 6a (kept as `TestHandleRequestVote_RefusesCandidateWithStaleLog` plus its grant-when-current counterpart). The full-damage scenario promised in 6a was run after 6c, on a scratch copy of the repo: n1 leads term 1 and commits two writes to n2 while n3 is partitioned; n1 dies; n3 (empty log) campaigns in term 9. **Control, restriction intact:** n2 refuses; n3 holds 1 of 3 votes and cannot lead. **Restriction removed:** n2 grants, n3 wins legitimately, takes one write, and n2's log goes from `[committed-a committed-b]` to `[new-leader-write]` — two writes n1 had reported committed, gone. n2 is also left with `commitIndex=2, LastIndex=1`.
+Why wrong at a deep level: the election restriction is the only thing that guarantees a new leader holds every committed entry. Without it, "committed" means nothing — any node can win and rewrite history.
+
+**Break 3 (6b) — consistency check removed (named by CLAUDE.md)**
+Change: deleted the `prevLogIndex`/`prevLogTerm` check.
+Prediction: a lagging follower accepts the leader's optimistic first guess and is credited with entries it doesn't have.
+Observed: `TestReplication_LaggingFollowerIsNotCountedAsCaughtUp` (written for this break, kept permanently) failed with `matchIndex=3 for a follower whose log ends at 1`; both consistency-check unit tests failed. A further scratch demonstration showed the follower's log physically corrupted — `Index=6` at slice position 2 — and unloadable on restart.
+Why wrong at a deep level: two independent failures from one missing check. Logical: committed data on a single machine. Physical: a node that can never come back.
+
+**Break 4 (6b) — follower acknowledges before fsync (named by CLAUDE.md)**
+Change: `Log.Append` moved into a goroutine; `Success` returned immediately.
+Prediction: `TestAppendEntries_EntriesAreDurableBeforeSuccess` fails.
+Observed: **passed 20 out of 20 runs — the test never caught the realistic version.** Only after adding a 50ms sleep to widen the window did it fail (`reopened log LastIndex() = 0` after `Success` was returned).
+Why wrong at a deep level, and why the test can't see it: two independent reasons. Timing — the goroutine usually wins the race against the test's next statement. And the Milestone 4 lesson again — even with perfect timing, a test on a live OS reads through the page cache and cannot tell "fsynced" from "buffered." That test catches gross ordering mistakes only; it is not a durability regression test, despite its name.
+
+### Interview Questions and Answers
+
+Q1: Prove that committing a current-term entry on a majority makes every earlier entry in that leader's log permanently safe.
+A: Any future candidate needs a majority; it overlaps the majority holding the entry; by the election restriction that holder rejects a candidate without the entry; so every future leader has it; Log Matching preserves every earlier entry.
+Assessment: needs more depth.
+What was missing: the proof proves too much — substitute "old-term entry" and every sentence still reads true, yet Figure 8 shows the conclusion is false. The election restriction never checks containment; it compares last log terms. A current-term entry (term T) on a majority raises every holder's last term to at least T, so any winner's last entry comes from a leader of term at least T, all of whom hold the entry by induction. An old-term entry (term S) leaves holders' last term at S, so a candidate whose last entry came from an intermediate-term leader that never had it can still outrank them. Also, quorum intersection is size-independent, not specific to 5 nodes.
+
+Q2: The election restriction (6a) and the current-term commit rule (6c) both protect committed entries. Is one redundant?
+A: Neither. The restriction keeps committed entries in future leaders; the current-term rule prevents incorrectly committing an old-term entry in the first place.
+Assessment: strong.
+What could be sharpened: they're dependent, not just complementary — (b) is only safe because of (a), and exists to limit commitment to the cases where (a) is strong enough. Delete (a) and (b) protects nothing; delete (b) and (a) can't save old-term entries. Break 2's full-damage run is direct evidence for (a).
+
+Q3: Full-cluster power loss after entry 5 is committed. Is data lost? How and when is it re-committed? What if no client ever writes again?
+A: Not lost if fsynced; commitIndex is volatile and recomputed; a new leader can't commit an old-term entry directly, so production Raft appends a no-op in the new term; without it, commitIndex may never advance.
+Assessment: strong — found a real gap.
+What could be sharpened: "fsynced on a majority before being counted committed," not "before the leader acknowledged"; and there's no "if" about the new leader having it — committed means on a majority, so the election restriction guarantees every possible new leader has it. The hedge "if there is no leader no-op mechanism" — there isn't one in this code, confirmed on a scratch copy: commitIndex stayed 0 on all three nodes through 10 replication rounds, and jumped to 2 everywhere after a single current-term Propose. In Milestone 7 this means durable-but-invisible data after a restart.
+
+Q4: Why `prevLogIndex + len(entries)` rather than `n.log.LastIndex()` for matchIndex? Construct the interleaving.
+A: A Propose appends entry 6 while an RPC carrying 4-5 is in flight; on success LastIndex() is 6; the leader records matchIndex=6 and may commit 6 though it was never sent.
+Assessment: strong.
+What could be sharpened: "may commit" is "will commit" in a 3-node cluster — leader plus this follower is a majority, and Propose stamps the current term so Figure 8 doesn't apply. The general principle (record what was verified, not what anyone holds) is the same one behind the follower's `min(leaderCommit, prevLogIndex+len(entries))`. Exposed a test gap: none of the existing 50 tests caught this variant; `TestReplication_MatchIndexCountsOnlyEntriesActuallySent` was added and verified to fail on the mutant.
+
+Q5: Can unconditional truncation destroy committed entries, or only uncommitted ones?
+A: Yes — a delayed duplicate with prevLogIndex=7 carrying entry 8 makes the naive follower truncate 8-10 after 9-10 were committed.
+Assessment: strong.
+What could be sharpened: why deleting on ONE follower destroys committed data — the entry can drop below a majority while the leader, whose matchIndex only ever increases, keeps counting this follower; a leader crash in that window lets a new leader without 9-10 win legitimately. In this implementation the reordering is routine whenever latency exceeds one 10ms tick. And on the follower itself, commitIndex (never decreasing) now points past the end of its log — in Milestone 7 that is an out-of-range apply, or permanent silent divergence if 9-10 are later replaced and lastApplied is already past them.
+
+Overall: 4 strong, 1 needs more depth. A clear improvement on Milestone 5's gap — constructions were given where they were asked for.
+
+### Git Commit Message
+`feat: add Raft log replication with consistency check, conflict repair, and commitIndex`
+
+### Open Questions
+- **No no-op entry on election** (Q3). A new leader holding only
+  previous-term entries can never commit them until a client writes.
+  Confirmed. Planned as the first step of Milestone 7, which is also where
+  linearizable reads need it and where the apply loop must learn to skip
+  no-op commands.
+- **No conflict-hint optimization.** Backtracking is one index per round
+  trip; a follower far behind on a different term costs one RTT per stale
+  entry. The paper's hint (conflicting term + first index of that term)
+  would need two new `AppendEntriesResponse` fields.
+- **`matchIndex` never decreases, even on rejection.** Correct for honest
+  followers, but it means a follower that loses entries (Q5's naive
+  truncation, or disk corruption) keeps being counted for them with no
+  detection.
+- **The durability test is weaker than its name** (Break 4). It cannot
+  distinguish fsynced from page-cached on a live OS. Real verification
+  needs crash-consistency tooling; same limitation documented in
+  Milestone 4.
+- **Nothing in the running system calls `Propose` yet.** A live Docker
+  cluster would show only empty heartbeats, so this milestone was verified
+  in-process (51 tests) rather than on a real cluster. Milestone 7 wires KV
+  writes to `Propose`.
+- **The KV WAL is now redundant** and is scheduled for deletion in
+  Milestone 7.
+- **The log grows without bound** until Milestone 8's snapshots.
+- **The leader replicates on every 10ms tick**, with no separate heartbeat
+  interval. Fine at 3 nodes; it's also what makes RPC reordering routine.
+
+---
+
 <!-- All future entries go below this line, in chronological order -->

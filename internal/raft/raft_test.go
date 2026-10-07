@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -26,11 +27,17 @@ func (p fakePeer) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesRe
 
 func newTestNode(t *testing.T, id uint64) *Node {
 	t.Helper()
-	s, err := LoadState(filepath.Join(t.TempDir(), "raft-state.dat"))
+	dir := t.TempDir()
+	s, err := LoadState(filepath.Join(dir, "raft-state.dat"))
 	if err != nil {
 		t.Fatalf("LoadState: %v", err)
 	}
-	return NewNode(id, s, map[uint64]Peer{})
+	l, err := OpenLog(filepath.Join(dir, "raft-log.dat"))
+	if err != nil {
+		t.Fatalf("OpenLog: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	return NewNode(id, s, l, map[uint64]Peer{})
 }
 
 // newTestCluster wires n nodes together with fakePeers pointing at each
@@ -146,6 +153,54 @@ func TestHandleRequestVote_HigherTermCausesStepDown(t *testing.T) {
 	}
 	if n.state.CurrentTerm() != 9 {
 		t.Fatalf("CurrentTerm() = %d, want 9", n.state.CurrentTerm())
+	}
+}
+
+// This test checks the election restriction (Raft paper 5.4.1) at the Node
+// level, not just Log.IsUpToDate in isolation: a voter holding real entries
+// must REFUSE a candidate whose log is behind, even when that candidate
+// campaigns with a much higher term. Without this, the stale candidate wins,
+// becomes leader, and forces its own (missing) log onto everyone else,
+// destroying entries that were already committed.
+func TestHandleRequestVote_RefusesCandidateWithStaleLog(t *testing.T) {
+	n := newTestNode(t, 1)
+	if err := n.log.Append(
+		&raftpb.LogEntry{Term: 5, Index: 1, Command: []byte("committed-x")},
+		&raftpb.LogEntry{Term: 5, Index: 2, Command: []byte("committed-y")},
+	); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	// A candidate with an EMPTY log, campaigning in a far higher term.
+	resp := n.HandleRequestVote(&raftpb.RequestVoteRequest{
+		Term: 9, CandidateId: 2, LastLogIndex: 0, LastLogTerm: 0,
+	})
+
+	if resp.VoteGranted {
+		t.Fatalf("granted a vote to a candidate with an empty log while holding 2 entries through term 5")
+	}
+	// The term is still adopted even though the vote is refused — the term
+	// rule and the election restriction are independent.
+	if n.state.CurrentTerm() != 9 {
+		t.Fatalf("CurrentTerm() = %d, want 9 — the higher term must still be adopted", n.state.CurrentTerm())
+	}
+}
+
+// This test checks the complementary invariant: a candidate whose log is at
+// least as up-to-date IS granted the vote, so the restriction blocks only
+// genuinely-behind candidates rather than deadlocking all elections.
+func TestHandleRequestVote_GrantsToCandidateWithUpToDateLog(t *testing.T) {
+	n := newTestNode(t, 1)
+	if err := n.log.Append(&raftpb.LogEntry{Term: 5, Index: 1, Command: []byte("x")}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	resp := n.HandleRequestVote(&raftpb.RequestVoteRequest{
+		Term: 9, CandidateId: 2, LastLogIndex: 1, LastLogTerm: 5,
+	})
+
+	if !resp.VoteGranted {
+		t.Fatalf("refused a candidate whose log matches ours exactly, want granted")
 	}
 }
 
@@ -297,4 +352,39 @@ func TestThreeNodeCluster_ReElectsAfterLeaderStops(t *testing.T) {
 	if newLeaderCount != 1 {
 		t.Fatalf("new leaders among remaining nodes = %d, want exactly 1", newLeaderCount)
 	}
+}
+
+// deadPeer simulates a node that is down or partitioned away: every RPC
+// fails immediately.
+type deadPeer struct{}
+
+func (deadPeer) RequestVote(ctx context.Context, req *raftpb.RequestVoteRequest) (*raftpb.RequestVoteResponse, error) {
+	return nil, errors.New("peer is unreachable")
+}
+
+func (deadPeer) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error) {
+	return nil, errors.New("peer is unreachable")
+}
+
+// gatedPeer forwards to an inner Peer, but holds every AppendEntries that
+// carries entries until the test releases it. That lets a test change the
+// leader's state while one specific request is provably in flight — the
+// only way to make a concurrency interleaving deterministic, rather than
+// running the test many times and hoping the scheduler produces it.
+type gatedPeer struct {
+	inner   Peer
+	arrived chan struct{} // signalled once an entry-carrying request is in flight
+	release chan struct{} // closed by the test to let that request through
+}
+
+func (g *gatedPeer) RequestVote(ctx context.Context, req *raftpb.RequestVoteRequest) (*raftpb.RequestVoteResponse, error) {
+	return g.inner.RequestVote(ctx, req)
+}
+
+func (g *gatedPeer) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error) {
+	if len(req.Entries) > 0 {
+		g.arrived <- struct{}{}
+		<-g.release
+	}
+	return g.inner.AppendEntries(ctx, req)
 }

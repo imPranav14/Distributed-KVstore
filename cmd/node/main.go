@@ -113,7 +113,14 @@ func main() {
 		peers[peerID] = peerClient
 	}
 
-	raftNode := raft.NewNode(uint64(cfg.NodeID), raftState, peers)
+	raftLogPath := filepath.Join(cfg.DataDir, "raft-log.dat")
+	raftLog, err := raft.OpenLog(raftLogPath)
+	if err != nil {
+		slog.Error("node: failed to open raft log", "path", raftLogPath, "error", err)
+		os.Exit(1)
+	}
+
+	raftNode := raft.NewNode(uint64(cfg.NodeID), raftState, raftLog, peers)
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
 	if err != nil {
@@ -164,5 +171,8 @@ func main() {
 
 	if err := w.Close(); err != nil {
 		slog.Error("node: failed to close WAL", "error", err)
+	}
+	if err := raftLog.Close(); err != nil {
+		slog.Error("node: failed to close raft log", "error", err)
 	}
 }

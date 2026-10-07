@@ -34,12 +34,12 @@ func (n *Node) HandleRequestVote(req *raftpb.RequestVoteRequest) *raftpb.Request
 	// answered. Only a DIFFERENT candidate is refused.
 	alreadyVotedElsewhere := votedFor != NoVote && votedFor != req.CandidateId
 
-	// Choice 3 from the concept brief: the log up-to-date check is
-	// vacuously true until Milestone 6 gives nodes an actual log to
-	// compare (last_log_index/last_log_term are always 0 on both sides
-	// right now). Carried as a named variable rather than inlined so the
-	// gap is visible, not silently absent.
-	candidateLogIsUpToDate := true
+	// The election restriction (Raft paper 5.4.1), real as of Milestone 6:
+	// refuse a candidate whose log is less up-to-date than ours. This is
+	// what guarantees a new leader already holds every entry that was
+	// committed in a previous term — without it, a node missing committed
+	// entries could win and then overwrite them.
+	candidateLogIsUpToDate := n.log.IsUpToDate(req.LastLogIndex, req.LastLogTerm)
 
 	if alreadyVotedElsewhere || !candidateLogIsUpToDate {
 		return &raftpb.RequestVoteResponse{Term: n.state.CurrentTerm(), VoteGranted: false}
@@ -74,9 +74,13 @@ func (n *Node) startElection() {
 	for id, p := range n.peers {
 		peers[id] = p
 	}
+	// Snapshot our log position while still holding mu, so every peer sees
+	// the same values even if the log changes mid-election.
+	lastLogIndex := n.log.LastIndex()
+	lastLogTerm := n.log.LastTerm()
 	n.mu.Unlock()
 
-	slog.Info("raft: starting election", "node_id", n.id, "term", electionTerm)
+	slog.Info("raft: starting election", "node_id", n.id, "term", electionTerm, "last_log_index", lastLogIndex, "last_log_term", lastLogTerm)
 
 	votes := 1 // ourselves
 	voteCh := make(chan bool, len(peers))
@@ -90,8 +94,8 @@ func (n *Node) startElection() {
 			resp, err := peer.RequestVote(ctx, &raftpb.RequestVoteRequest{
 				Term:         electionTerm,
 				CandidateId:  n.id,
-				LastLogIndex: 0, // vacuous until Milestone 6
-				LastLogTerm:  0,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  lastLogTerm,
 			})
 			if err != nil {
 				voteCh <- false
@@ -123,75 +127,18 @@ func (n *Node) startElection() {
 		haveMajority := votes > (len(n.peers)+1)/2
 		if stillRelevant && haveMajority {
 			n.role = Leader
+			// Must happen before releasing mu: a concurrent Propose or
+			// replication tick that sees role == Leader would otherwise
+			// read a nil nextIndex/matchIndex map.
+			n.initializeLeaderStateLocked()
 			n.mu.Unlock()
 			slog.Info("raft: elected leader", "node_id", n.id, "term", electionTerm, "votes", votes)
-			n.sendHeartbeats() // immediately — don't wait for the next tick
+			n.replicateToAll() // immediately — don't wait for the next tick
 			return
 		}
 		n.mu.Unlock()
 	}
 }
 
-// HandleAppendEntries processes a heartbeat (or, from Milestone 6, real
-// log entries). At this milestone entries is always empty — receiving the
-// RPC at all IS the heartbeat.
-func (n *Node) HandleAppendEntries(req *raftpb.AppendEntriesRequest) *raftpb.AppendEntriesResponse {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if req.Term < n.state.CurrentTerm() {
-		// Stale leader, from a term that's already over. Reject.
-		return &raftpb.AppendEntriesResponse{Term: n.state.CurrentTerm(), Success: false}
-	}
-
-	if req.Term > n.state.CurrentTerm() {
-		n.becomeFollowerLocked(req.Term)
-	} else if n.role == Candidate {
-		// Same term, but someone else already won this election — step
-		// down without bumping the term (we're not behind, we just lost).
-		n.role = Follower
-	}
-
-	n.resetElectionTimerLocked()
-	return &raftpb.AppendEntriesResponse{Term: n.state.CurrentTerm(), Success: true}
-}
-
-// sendHeartbeats fans AppendEntries out to every peer in parallel. A no-op
-// if this node is no longer leader by the time it actually runs (e.g. a
-// tick fired right as an election was lost).
-func (n *Node) sendHeartbeats() {
-	n.mu.Lock()
-	if n.role != Leader {
-		n.mu.Unlock()
-		return
-	}
-	term := n.state.CurrentTerm()
-	peers := make(map[uint64]Peer, len(n.peers))
-	for id, p := range n.peers {
-		peers[id] = p
-	}
-	n.mu.Unlock()
-
-	for _, peer := range peers {
-		peer := peer
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
-			defer cancel()
-
-			resp, err := peer.AppendEntries(ctx, &raftpb.AppendEntriesRequest{
-				Term:     term,
-				LeaderId: n.id,
-				Entries:  nil,
-			})
-			if err != nil {
-				return
-			}
-
-			n.mu.Lock()
-			if resp.Term > n.state.CurrentTerm() {
-				n.becomeFollowerLocked(resp.Term)
-			}
-			n.mu.Unlock()
-		}()
-	}
-}
+// AppendEntries handling and the leader's replication loop live in
+// replication.go, per CLAUDE.md's file layout.

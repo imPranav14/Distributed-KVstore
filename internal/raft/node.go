@@ -34,7 +34,7 @@ type Peer interface {
 }
 
 const (
-	tickInterval      = 10 * time.Millisecond
+	tickInterval       = 10 * time.Millisecond
 	electionTimeoutMin = 150 * time.Millisecond
 	electionTimeoutMax = 300 * time.Millisecond
 	// rpcTimeout bounds a single RequestVote/AppendEntries call. Shorter
@@ -49,7 +49,7 @@ const (
 type Node struct {
 	// mu protects every field below. Every RPC handler, the background
 	// timer loop, and every peer-response goroutine spawned by
-	// startElection/sendHeartbeats reads or writes through this same lock —
+	// startElection/replicateToAll reads or writes through this same lock —
 	// there is exactly one lock for all of a node's mutable state, same
 	// simplicity-first reasoning as store.Store's single RWMutex.
 	mu sync.Mutex
@@ -57,10 +57,36 @@ type Node struct {
 	id    uint64
 	peers map[uint64]Peer
 	state *State // Milestone 5a — persistent term/votedFor
+	log   *Log   // Milestone 6a — the replicated log
 
 	role            Role
 	lastHeartbeat   time.Time     // reset on: valid AppendEntries, granting a vote, starting our own election
 	electionTimeout time.Duration // randomized, re-rolled on every reset — see resetElectionTimerLocked
+
+	// commitIndex is the highest log index known to be committed
+	// (replicated on a majority, and therefore guaranteed to survive any
+	// future leader election).
+	//
+	// Deliberately NOT persisted, per the Raft paper: it is volatile state.
+	// A restarted node starts at 0 and safely re-learns its commit index
+	// from the next leader's AppendEntries. Persisting it would buy nothing
+	// — the entries themselves are already durable, and an over-eager
+	// commitIndex restored from disk would be strictly more dangerous than
+	// an under-eager one rebuilt from the leader.
+	commitIndex uint64
+
+	// nextIndex and matchIndex are leader-only state, reinitialized every
+	// time this node wins an election and meaningless otherwise.
+	//
+	// The asymmetry in how they start is deliberate and load-bearing:
+	// nextIndex is OPTIMISTIC (assume the follower matches us exactly, and
+	// back off on rejection), while matchIndex is PESSIMISTIC (assume we
+	// know nothing until a follower actually confirms). Optimism on
+	// nextIndex costs at most a few wasted round trips; optimism on
+	// matchIndex would let a brand-new leader count entries as replicated
+	// that no follower has, and commit them.
+	nextIndex  map[uint64]uint64
+	matchIndex map[uint64]uint64
 
 	stopCh chan struct{} // closed by Stop(); read by run()'s select loop
 }
@@ -70,11 +96,12 @@ type Node struct {
 // start the background timer loop — call Start() separately, so tests can
 // exercise handler methods directly without a timer race in the
 // background.
-func NewNode(id uint64, state *State, peers map[uint64]Peer) *Node {
+func NewNode(id uint64, state *State, log *Log, peers map[uint64]Peer) *Node {
 	n := &Node{
 		id:     id,
 		peers:  peers,
 		state:  state,
+		log:    log,
 		role:   Follower,
 		stopCh: make(chan struct{}),
 	}
@@ -105,6 +132,13 @@ func (n *Node) Role() Role {
 	return n.role
 }
 
+// CommitIndex returns the highest log index known to be committed.
+func (n *Node) CommitIndex() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.commitIndex
+}
+
 func (n *Node) run() {
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
@@ -121,7 +155,7 @@ func (n *Node) run() {
 
 			switch {
 			case role == Leader:
-				n.sendHeartbeats()
+				n.replicateToAll()
 			case timedOut:
 				n.startElection()
 			}
