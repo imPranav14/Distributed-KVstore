@@ -1,105 +1,142 @@
-// Package server implements the gRPC-facing KVStore service, translating
-// wire requests into calls against the local store.Store, dedup.Table, and
-// (since Milestone 4) wal.WAL.
+// Package server implements the gRPC-facing services: KVStore (for
+// clients) and Raft (for other nodes).
 //
-// At this milestone there is no Raft yet: every node serves requests
-// against its own local state only. No replication, no leader election.
-// Milestone 7 is where writes get rerouted through a Raft log before being
-// applied here.
+// As of Milestone 7b, every write goes through Raft: the handler proposes
+// a command, waits until the replicated state machine has applied it, and
+// only then replies. There is no local-only write path and no separate WAL
+// anymore — the Raft log IS the write-ahead log.
 package server
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/imPranav14/Distributed-KVstore/internal/dedup"
-	"github.com/imPranav14/Distributed-KVstore/internal/store"
-	"github.com/imPranav14/Distributed-KVstore/internal/wal"
+	"github.com/imPranav14/Distributed-KVstore/internal/raft"
 	kvpb "github.com/imPranav14/Distributed-KVstore/proto/kv"
 )
 
-// KVServer implements kvpb.KVStoreServer.
+// applyWaitTimeout caps how long a write handler waits for its entry to be
+// applied. Clients normally set a shorter deadline of their own (the
+// client's perAttemptTimeout is 2s); this is the backstop for callers that
+// set none, so a partitioned leader can't hold a handler forever.
+const applyWaitTimeout = 5 * time.Second
+
+// KVServer implements kvpb.KVStoreServer on top of Raft.
 type KVServer struct {
 	// UnimplementedKVStoreServer must be embedded (by value, per its own
 	// doc comment) for forward compatibility: if a future version of
 	// kv.proto adds a new RPC method, this embedded type supplies a default
 	// (returns Unimplemented) so this file doesn't fail to compile the
-	// moment the .proto grows — only intentionally-implemented methods
-	// below override that default.
+	// moment the .proto grows.
 	kvpb.UnimplementedKVStoreServer
 
-	store *store.Store
-	dedup *dedup.Table
-	wal   *wal.WAL
+	raftNode     *raft.Node
+	stateMachine *StateMachine
 }
 
-// NewKVServer wires a KVServer to already-constructed dependencies. It does
-// not create them itself — per Rule 2, wiring dependencies together is
-// main.go's job, not this package's. w's WAL is expected to have already
-// been replayed into s by the caller before this server starts accepting
-// requests.
-func NewKVServer(s *store.Store, d *dedup.Table, w *wal.WAL) *KVServer {
-	return &KVServer{store: s, dedup: d, wal: w}
+// NewKVServer wires a KVServer to an already-running Raft node and the
+// state machine consuming its apply channel. Wiring them together is
+// main.go's job (Rule 2), not this package's.
+func NewKVServer(node *raft.Node, sm *StateMachine) *KVServer {
+	return &KVServer{raftNode: node, stateMachine: sm}
 }
 
-// Get reads a key directly from the local store. It does not go through
-// dedup or the WAL: Get is read-only and side-effect-free, so replaying it
-// any number of times is always safe — there is nothing to make durable.
+// Get reads a key from the replicated store, on the leader only.
+//
+// TRANSITIONAL (Milestone 7b): this is NOT yet linearizable. Two known
+// gaps, both closed by Milestone 7c's ReadIndex:
+//   - A stale leader, cut off by a partition, still believes it is leader
+//     and keeps answering from data that a newer leader has since changed.
+//   - Right after a leader change, the new leader may not have finished
+//     replaying its log yet, so a key that exists can read as not found.
 func (s *KVServer) Get(ctx context.Context, req *kvpb.GetRequest) (*kvpb.GetResponse, error) {
-	value, found := s.store.Get(req.Key)
+	if s.raftNode.Role() != raft.Leader {
+		return nil, status.Error(codes.Unavailable, "not leader")
+	}
+	value, found := s.stateMachine.Get(req.Key)
 	return &kvpb.GetResponse{Value: value, Found: found}, nil
 }
 
-// Put durably records the write to the WAL, THEN applies it to the store —
-// write-ahead, not the other way around. If a crash happens between those
-// two steps, the WAL entry is what survives; replay on restart is what
-// rebuilds the in-memory store, so which one runs "first" here only matters
-// for making sure the durable record exists before anything else depends
-// on the write having happened.
-//
-// This is the first real failure mode this server has had: a WAL write can
-// fail (disk full, I/O error). dedup.Execute's error return, added this
-// milestone, is what makes that failure propagate correctly instead of
-// being silently swallowed — and, just as importantly, ensures a failed
-// write is NOT recorded as seen, so the client's retry can actually
-// succeed once whatever was wrong with the disk is resolved.
+// Put replicates a write through Raft and replies once it is applied.
 func (s *KVServer) Put(ctx context.Context, req *kvpb.PutRequest) (*kvpb.PutResponse, error) {
-	clientID := dedup.ClientID(req.ClientId)
-	requestID := dedup.RequestID(req.RequestId)
-
-	_, err := s.dedup.Execute(clientID, requestID, func() error {
-		if err := s.wal.Append(&wal.Entry{Op: wal.OpPut, Key: req.Key, Value: req.Value}); err != nil {
-			return fmt.Errorf("kv_server: failed to persist Put for key=%q: %w", req.Key, err)
-		}
-		s.store.Put(req.Key, req.Value)
-		return nil
-	})
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "put failed: %v", err)
+	cmd := &kvpb.Command{
+		Op:        kvpb.Command_OP_PUT,
+		Key:       req.Key,
+		Value:     req.Value,
+		ClientId:  req.ClientId,
+		RequestId: req.RequestId,
 	}
-
+	if err := s.replicate(ctx, cmd); err != nil {
+		return nil, err
+	}
 	return &kvpb.PutResponse{}, nil
 }
 
-// Delete durably records the delete to the WAL, then applies it to the
-// store — same write-ahead reasoning and failure handling as Put.
+// Delete replicates a delete through Raft and replies once it is applied.
 func (s *KVServer) Delete(ctx context.Context, req *kvpb.DeleteRequest) (*kvpb.DeleteResponse, error) {
-	clientID := dedup.ClientID(req.ClientId)
-	requestID := dedup.RequestID(req.RequestId)
+	cmd := &kvpb.Command{
+		Op:        kvpb.Command_OP_DELETE,
+		Key:       req.Key,
+		ClientId:  req.ClientId,
+		RequestId: req.RequestId,
+	}
+	if err := s.replicate(ctx, cmd); err != nil {
+		return nil, err
+	}
+	return &kvpb.DeleteResponse{}, nil
+}
 
-	_, err := s.dedup.Execute(clientID, requestID, func() error {
-		if err := s.wal.Append(&wal.Entry{Op: wal.OpDelete, Key: req.Key}); err != nil {
-			return fmt.Errorf("kv_server: failed to persist Delete for key=%q: %w", req.Key, err)
-		}
-		s.store.Delete(req.Key)
-		return nil
-	})
+// replicate proposes cmd, waits until the state machine has applied the
+// entry at the proposed index, and confirms that entry is ours.
+//
+// INVARIANT: an error from this function means the outcome is UNKNOWN, not
+// that the write failed. A timeout can fire one instant before the entry
+// commits; a lost-leadership error is only certain about THIS proposal,
+// not about an earlier attempt of the same request. That is exactly why the
+// client always retries with the SAME request ID: if any earlier attempt
+// did apply, the replicated dedup table in StateMachine skips the retry on
+// every replica.
+func (s *KVServer) replicate(ctx context.Context, cmd *kvpb.Command) error {
+	data, err := encodeCommand(cmd)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "delete failed: %v", err)
+		return status.Errorf(codes.Internal, "encode failed: %v", err)
 	}
 
-	return &kvpb.DeleteResponse{}, nil
+	index, term, isLeader := s.raftNode.Propose(data)
+	if !isLeader {
+		// Also returned if the leader's own log append failed. Either way
+		// this node did not accept the write; the client should try
+		// another node.
+		return status.Error(codes.Unavailable, "not leader")
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, applyWaitTimeout)
+	defer cancel()
+
+	if err := s.stateMachine.WaitForApplied(waitCtx, index); err != nil {
+		if errors.Is(err, errStateMachineStopped) {
+			return status.Error(codes.Unavailable, "node is shutting down")
+		}
+		// The deadline or cancellation came from ctx: report it as such,
+		// so the client sees DeadlineExceeded/Canceled rather than a
+		// generic failure.
+		return status.FromContextError(err).Err()
+	}
+
+	// INVARIANT: the entry applied at index is ours if and only if it has
+	// the term we proposed it in. Within one term there is exactly one
+	// leader, and it assigns each index exactly once — so by the Log
+	// Matching Property, (index, term) identifies one entry. A different
+	// term means this node lost leadership before our entry committed, and
+	// a later leader's entry took the slot. Returning OK here would tell
+	// the client its write succeeded when it was overwritten.
+	appliedTerm, ok := s.raftNode.TermAt(index)
+	if !ok || appliedTerm != term {
+		return status.Error(codes.Unavailable, "leadership lost before the write committed")
+	}
+	return nil
 }

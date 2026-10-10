@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -60,18 +62,73 @@ type StateMachine struct {
 	store *store.Store
 	dedup *dedup.Table
 
-	// mu protects lastApplied. Written only by the Run goroutine; read by
-	// gRPC handler goroutines (Milestone 7b's commit waiters and 7c's
-	// ReadIndex wait), which need to know how far application has got.
+	// mu protects lastApplied and appliedCh. Both are written only by the
+	// Run goroutine; read by gRPC handler goroutines waiting in
+	// WaitForApplied for their entry to be applied.
 	mu          sync.Mutex
 	lastApplied uint64
+
+	// appliedCh is a broadcast: closed (waking every waiter at once) and
+	// replaced with a fresh channel on every apply. Used instead of
+	// sync.Cond because a Cond cannot be selected against ctx.Done().
+	appliedCh chan struct{}
+
+	// stopped is closed when Run returns. After that nothing will ever be
+	// applied again, so waiters must give up immediately rather than sit
+	// out their full timeout — otherwise every in-flight Put would stall
+	// a graceful shutdown for up to applyWaitTimeout.
+	stopped chan struct{}
 }
 
 // NewStateMachine wraps an EMPTY store and dedup table. Its state is built
 // entirely by applying the committed log from index 1 — there is no other
 // recovery path, which is what makes the KV WAL redundant.
 func NewStateMachine(s *store.Store, d *dedup.Table) *StateMachine {
-	return &StateMachine{store: s, dedup: d}
+	return &StateMachine{
+		store:     s,
+		dedup:     d,
+		appliedCh: make(chan struct{}),
+		stopped:   make(chan struct{}),
+	}
+}
+
+// errStateMachineStopped is returned by WaitForApplied once Run has exited.
+var errStateMachineStopped = errors.New("server: state machine stopped")
+
+// WaitForApplied blocks until the entry at index has been applied, the state
+// machine stops, or ctx ends.
+//
+// INVARIANT: the "already applied?" check and the read of appliedCh happen
+// under ONE lock acquisition. Split them across two, and the entry can be
+// applied in the gap: the waiter would then sleep on a channel that has
+// already been closed and replaced, missing the wakeup entirely, and return
+// only when its timeout fired — the classic lost-wakeup bug.
+func (sm *StateMachine) WaitForApplied(ctx context.Context, index uint64) error {
+	for {
+		sm.mu.Lock()
+		if sm.lastApplied >= index {
+			sm.mu.Unlock()
+			return nil
+		}
+		wakeup := sm.appliedCh
+		sm.mu.Unlock()
+
+		select {
+		case <-wakeup:
+			// Something was applied — loop and re-check, since it may not
+			// have been our index yet.
+		case <-sm.stopped:
+			return errStateMachineStopped
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// Get reads a key from the replicated store. Safe to call concurrently with
+// Run: store.Store has its own lock.
+func (sm *StateMachine) Get(key string) (value string, found bool) {
+	return sm.store.Get(key)
 }
 
 // Run applies every message from applyCh until the channel is closed, which
@@ -85,6 +142,10 @@ func NewStateMachine(s *store.Store, d *dedup.Table) *StateMachine {
 // Returns the first apply error. Callers must treat that as fatal for this
 // node — see apply for why continuing is unsafe.
 func (sm *StateMachine) Run(applyCh <-chan raft.ApplyMsg) error {
+	// Release every WaitForApplied caller on ANY exit — clean shutdown or
+	// fail-stop — since nothing will be applied after this returns.
+	defer close(sm.stopped)
+
 	for msg := range applyCh {
 		if err := sm.apply(msg); err != nil {
 			return err
@@ -149,6 +210,9 @@ func (sm *StateMachine) apply(msg raft.ApplyMsg) error {
 func (sm *StateMachine) markApplied(index uint64) {
 	sm.mu.Lock()
 	sm.lastApplied = index
+	// Wake every waiter, then arm a fresh channel for the next apply.
+	close(sm.appliedCh)
+	sm.appliedCh = make(chan struct{})
 	sm.mu.Unlock()
 }
 

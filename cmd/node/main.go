@@ -1,10 +1,9 @@
 // Command node is the entry point for a single KV store node. As of
-// Milestone 5, nodes actually talk to each other: each one runs Raft leader
-// election against its peers (terms, randomized timeouts, RequestVote,
-// heartbeats) and the cluster elects — and, if the leader disappears,
-// re-elects — a single leader. Log replication and routing client writes
-// through consensus are still Milestone 6/7; a node accepts KV requests
-// against its own local state regardless of its Raft role for now.
+// Milestone 7b, every client write goes through Raft: the leader proposes
+// it, a majority stores it, and every node's state machine applies it in
+// the same order. The Raft log is the only write-ahead log — the separate
+// KV WAL from Milestone 4 is gone, and a restarted node rebuilds its store
+// by re-applying its committed log from index 1.
 package main
 
 import (
@@ -23,37 +22,9 @@ import (
 	"github.com/imPranav14/Distributed-KVstore/internal/raft"
 	"github.com/imPranav14/Distributed-KVstore/internal/server"
 	"github.com/imPranav14/Distributed-KVstore/internal/store"
-	"github.com/imPranav14/Distributed-KVstore/internal/wal"
 	kvpb "github.com/imPranav14/Distributed-KVstore/proto/kv"
 	raftpb "github.com/imPranav14/Distributed-KVstore/proto/raft"
 )
-
-// replayWAL rebuilds a Store's state from every entry previously recorded
-// in w, in order. It must run to completion BEFORE the gRPC server starts
-// accepting requests — serving a request against a store that hasn't
-// finished recovering could return stale or missing data. Every Op value
-// here is guaranteed valid (OpPut or OpDelete) because wal.DecodeEntry
-// already rejected anything else during ReadAll — no default case needed
-// for a state that can't occur.
-func replayWAL(w *wal.WAL) (*store.Store, error) {
-	entries, err := w.ReadAll()
-	if err != nil {
-		return nil, fmt.Errorf("main: failed to read WAL for replay: %w", err)
-	}
-
-	s := store.NewStore()
-	for _, entry := range entries {
-		switch entry.Op {
-		case wal.OpPut:
-			s.Put(entry.Key, entry.Value)
-		case wal.OpDelete:
-			s.Delete(entry.Key)
-		}
-	}
-
-	slog.Info("node: replayed WAL", "entries_replayed", len(entries))
-	return s, nil
-}
 
 func main() {
 	cfg, err := config.Load()
@@ -72,23 +43,10 @@ func main() {
 	)
 
 	// DataDir may not exist yet on a brand-new node (fresh docker volume,
-	// fresh local run) — os.OpenFile's O_CREATE only creates the WAL file
-	// itself, not missing parent directories.
+	// fresh local run) — os.OpenFile's O_CREATE only creates the files
+	// themselves, not missing parent directories.
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
 		slog.Error("node: failed to create data directory", "data_dir", cfg.DataDir, "error", err)
-		os.Exit(1)
-	}
-
-	walPath := filepath.Join(cfg.DataDir, "wal.log")
-	w, err := wal.Open(walPath)
-	if err != nil {
-		slog.Error("node: failed to open WAL", "path", walPath, "error", err)
-		os.Exit(1)
-	}
-
-	recoveredStore, err := replayWAL(w)
-	if err != nil {
-		slog.Error("node: failed to replay WAL", "error", err)
 		os.Exit(1)
 	}
 
@@ -96,6 +54,13 @@ func main() {
 	raftState, err := raft.LoadState(raftStatePath)
 	if err != nil {
 		slog.Error("node: failed to load raft state", "path", raftStatePath, "error", err)
+		os.Exit(1)
+	}
+
+	raftLogPath := filepath.Join(cfg.DataDir, "raft-log.dat")
+	raftLog, err := raft.OpenLog(raftLogPath)
+	if err != nil {
+		slog.Error("node: failed to open raft log", "path", raftLogPath, "error", err)
 		os.Exit(1)
 	}
 
@@ -113,21 +78,11 @@ func main() {
 		peers[peerID] = peerClient
 	}
 
-	raftLogPath := filepath.Join(cfg.DataDir, "raft-log.dat")
-	raftLog, err := raft.OpenLog(raftLogPath)
-	if err != nil {
-		slog.Error("node: failed to open raft log", "path", raftLogPath, "error", err)
-		os.Exit(1)
-	}
-
-	// The replicated state machine, fed by committed Raft entries. Its store
-	// starts EMPTY and is rebuilt by re-applying the committed log from index
-	// 1 — that is its entire recovery path.
-	//
-	// TRANSITIONAL (Milestone 7a only): client requests still go through
-	// kvServer's own WAL-backed store below, so this state machine currently
-	// receives nothing but no-ops. Milestone 7b routes writes through
-	// raftNode.Propose, points kvServer at this store, and deletes the WAL.
+	// The replicated state machine starts EMPTY — store and dedup table
+	// both — and is rebuilt by re-applying the committed log from index 1.
+	// That is its entire recovery path. Dedup state is now replicated and
+	// replayed along with the data, so it survives restarts (Milestone 4's
+	// open question, closed in 7a).
 	applyCh := make(chan raft.ApplyMsg)
 	stateMachine := server.NewStateMachine(store.NewStore(), dedup.NewTable())
 	raftNode := raft.NewNode(uint64(cfg.NodeID), raftState, raftLog, peers, applyCh)
@@ -149,12 +104,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// dedup.NewTable() is deliberately fresh, not reconstructed from the
-	// WAL: dedup state is an accepted, named gap across restarts (see
-	// UNDERSTANDING.md's Milestone 4 entry) — PUT/DELETE are naturally
-	// idempotent, so a client retry landing after a restart just reapplies
-	// the same value rather than corrupting anything.
-	kvServer := server.NewKVServer(recoveredStore, dedup.NewTable(), w)
+	kvServer := server.NewKVServer(raftNode, stateMachine)
 	raftServer := server.NewRaftServer(raftNode)
 
 	grpcServer := grpc.NewServer()
@@ -171,8 +121,8 @@ func main() {
 	}()
 	slog.Info("node: serving KVStore and Raft", "addr", listener.Addr().String())
 
-	// raftNode.run()'s exit condition is raftNode.Stop() below, on
-	// shutdown — same Rule 5 pattern as the gRPC Serve goroutine above.
+	// raftNode's timer loop and applier both exit on raftNode.Stop() below —
+	// same Rule 5 pattern as the gRPC Serve goroutine above.
 	raftNode.Start()
 
 	// Block here until the process receives SIGINT (Ctrl+C) or SIGTERM
@@ -184,15 +134,17 @@ func main() {
 	receivedSignal := <-shutdownSignal
 
 	slog.Info("node: shutting down", "signal", receivedSignal.String())
+
+	// Order matters. Stopping Raft first makes the applier close applyCh,
+	// which ends stateMachine.Run, which closes its stopped channel — and
+	// that immediately releases every Put/Delete handler still waiting in
+	// WaitForApplied. Only then does GracefulStop have nothing left to wait
+	// on. In the reverse order, GracefulStop would sit waiting for handlers
+	// that are themselves waiting on applies that will never come, for up to
+	// applyWaitTimeout each.
 	raftNode.Stop()
-	// GracefulStop lets any in-flight RPC finish instead of cutting it off
-	// mid-request, then closes the listener, which is what makes the Serve
-	// goroutine above return.
 	grpcServer.GracefulStop()
 
-	if err := w.Close(); err != nil {
-		slog.Error("node: failed to close WAL", "error", err)
-	}
 	if err := raftLog.Close(); err != nil {
 		slog.Error("node: failed to close raft log", "error", err)
 	}

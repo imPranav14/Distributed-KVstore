@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -213,5 +215,114 @@ func TestStateMachine_RunAppliesUntilChannelClosed(t *testing.T) {
 	}
 	if sm.LastApplied() != 2 {
 		t.Fatalf("LastApplied() = %d, want 2", sm.LastApplied())
+	}
+}
+
+// --- WaitForApplied ---
+
+// This test checks that waiting for an index already applied returns at
+// once, without needing any further apply to wake it.
+func TestWaitForApplied_AlreadyAppliedReturnsImmediately(t *testing.T) {
+	sm := newTestStateMachine()
+	applyAll(t, sm, cmdMsg(t, 1, kvpb.Command_OP_PUT, "x", "1", "c1", 1))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := sm.WaitForApplied(ctx, 1); err != nil {
+		t.Fatalf("WaitForApplied on an already-applied index: %v", err)
+	}
+}
+
+// This test checks that a waiter is woken by the apply it is waiting for,
+// and NOT released early by an apply of a lower index. The waiter is
+// started first, then index 1 is applied (must keep waiting), then index 2
+// (must return).
+func TestWaitForApplied_WakesOnlyWhenTargetIndexIsApplied(t *testing.T) {
+	sm := newTestStateMachine()
+	result := make(chan error, 1)
+	go func() { result <- sm.WaitForApplied(context.Background(), 2) }()
+
+	time.Sleep(20 * time.Millisecond) // let the waiter start waiting
+	applyAll(t, sm, cmdMsg(t, 1, kvpb.Command_OP_PUT, "x", "1", "c1", 1))
+
+	select {
+	case err := <-result:
+		t.Fatalf("WaitForApplied(2) returned (%v) after only index 1 was applied", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	applyAll(t, sm, cmdMsg(t, 2, kvpb.Command_OP_PUT, "x", "2", "c1", 2))
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("WaitForApplied(2) = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("WaitForApplied(2) never returned after index 2 was applied — lost wakeup")
+	}
+}
+
+// This test checks the lost-wakeup invariant under concurrency: many
+// waiters, each for a different index, racing with a stream of applies.
+// If the "already applied?" check and the channel read were not under one
+// lock, some waiter would occasionally miss its wakeup and time out.
+func TestWaitForApplied_NoLostWakeupsUnderConcurrency(t *testing.T) {
+	sm := newTestStateMachine()
+	const entries = 200
+
+	results := make(chan error, entries)
+	for index := uint64(1); index <= entries; index++ {
+		index := index
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			results <- sm.WaitForApplied(ctx, index)
+		}()
+	}
+
+	for index := uint64(1); index <= entries; index++ {
+		applyAll(t, sm, cmdMsg(t, index, kvpb.Command_OP_PUT, "k", "v", "c1", index))
+	}
+
+	for i := 0; i < entries; i++ {
+		if err := <-results; err != nil {
+			t.Fatalf("a waiter failed: %v — a wakeup was lost", err)
+		}
+	}
+}
+
+// This test checks that a waiter gives up when its context ends.
+func TestWaitForApplied_ReturnsOnContextDeadline(t *testing.T) {
+	sm := newTestStateMachine()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	if err := sm.WaitForApplied(ctx, 1); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitForApplied = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+// This test checks that a waiter is released as soon as Run exits, with no
+// context deadline at all. Nothing will be applied after Run returns, so
+// waiting longer would only stall shutdown.
+func TestWaitForApplied_ReturnsWhenStateMachineStops(t *testing.T) {
+	sm := newTestStateMachine()
+	applyCh := make(chan raft.ApplyMsg)
+	go func() { _ = sm.Run(applyCh) }()
+
+	result := make(chan error, 1)
+	go func() { result <- sm.WaitForApplied(context.Background(), 1) }()
+
+	time.Sleep(20 * time.Millisecond)
+	close(applyCh) // what raft.Node's applier does on Stop
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, errStateMachineStopped) {
+			t.Fatalf("WaitForApplied = %v, want errStateMachineStopped", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("waiter still blocked after the state machine stopped")
 	}
 }

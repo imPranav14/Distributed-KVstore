@@ -1370,4 +1370,164 @@ together — the same pattern as Milestones 3, 4 and 6.
 
 ---
 
+## Milestone 7b — Writes Through Raft, KV WAL Deleted
+Date: 2026-10-10
+
+### The Problem This Solves
+After 7a, committed entries reached every node's state machine, but client
+writes still bypassed Raft entirely and landed on a separate WAL-backed
+store. This step moves every write onto the replicated path and removes the
+second log.
+
+The hard part isn't calling `Propose`. It's that `Propose` returning an
+index proves nothing: the handler must wait for that entry to be applied,
+then prove the entry applied at that index is actually its own. Leadership
+can be lost between proposing and committing, and a later leader's entry
+can take the slot.
+
+### The Design Decision Made
+**Write handlers wait for apply, then check the term.** After
+`WaitForApplied(index)`, the handler compares the term of the entry now at
+that index with the term it proposed in. Equal means it's ours: one leader
+per term, each index assigned once per term, so `(index, term)` identifies
+one entry (Log Matching). Unequal means a later leader's entry won the slot.
+Rejected alternative: comparing the applied command bytes. That works, but
+the term comparison is O(1) and leans on a property Raft already
+guarantees.
+
+**An error means "outcome unknown," not "failed."** A timeout can fire an
+instant before the entry commits. That's why the client always retries
+with the same request ID, and why 7a's replicated dedup had to exist first:
+the two halves only work together.
+
+**Waiting uses a broadcast channel, not `sync.Cond`.** `appliedCh` is
+closed and replaced on every apply. A `Cond` can't be selected against
+`ctx.Done()`, and handlers need to give up on their own deadline.
+
+**A `stopped` channel releases waiters at shutdown.** Once Raft stops,
+nothing is ever applied again. Without it, each in-flight write would hold
+`GracefulStop` for up to `applyWaitTimeout` (5s).
+
+**The KV WAL is deleted** (`internal/wal`: 4 files, 21 tests). The Raft log
+is the write-ahead log now; a restarted node rebuilds its store by
+re-applying its committed log. Milestone 4's lessons stay recorded in this
+journal; the code that taught them is gone.
+
+**`Get` is leader-only and explicitly transitional.** Not yet linearizable.
+Both gaps are left for 7c's ReadIndex rather than half-built here.
+
+### How It Works — Plain English
+A `Put` arrives. The server encodes it as a `Command` and hands it to Raft.
+A follower refuses immediately ("not leader"). The leader appends it to its
+log and gets back an index and a term. The handler then sleeps until its
+node's state machine reports that index as applied — woken by a broadcast
+each time anything is applied, or released early by its deadline or by the
+node shutting down. Once woken, it checks the term recorded at that index.
+Same term: the write is done, reply OK. Different term: this node lost
+leadership and someone else's entry is committed there, so reply with an
+error and let the client retry with the same request ID.
+
+On restart, nothing special happens: the node loads its Raft log, elects
+or follows, its leader's no-op commits, and every committed entry is
+re-applied from index 1. That replay is the whole recovery path.
+
+### Key Invariants
+- INVARIANT (`kv_server.go`): the entry applied at an index is ours if and
+  only if it has the term we proposed it in.
+- INVARIANT (`kv_server.go`): an error from `replicate` means the outcome is
+  unknown, not that the write failed; the client must retry with the same
+  request ID.
+- INVARIANT (`state_machine.go`): `WaitForApplied` checks `lastApplied` and
+  reads `appliedCh` under ONE lock acquisition, so no wakeup can fall into
+  the gap between them.
+- INVARIANT (`state_machine.go`): `Run` closes `stopped` on every exit path,
+  releasing all waiters.
+- INVARIANT (`main.go`): on shutdown, `raftNode.Stop()` runs before
+  `grpcServer.GracefulStop()`, so waiting handlers are released before
+  `GracefulStop` waits on them.
+
+### The Lines That Matter Most
+
+Line: `if !ok || appliedTerm != term { return status.Error(codes.Unavailable, "leadership lost ...") }`
+Does: refuses to report success for an index another leader's entry filled.
+Breaks without it: mutant verified, the handler returned OK for a write a new leader had overwritten (`error = <nil> (code OK), want code Unavailable`). The client would believe a write succeeded that exists nowhere.
+Why this way: the term comparison is enough because of Log Matching; it needs no byte comparison and no extra bookkeeping.
+
+Line: `wakeup := sm.appliedCh` read under the same lock as the `lastApplied >= index` check
+Does: guarantees a waiter either sees its index applied or holds the channel that will be closed when it is.
+Breaks without it: mutant verified, splitting the two lock acquisitions made the 200-waiter concurrency test fail 3 out of 3 runs (`a waiter failed: context deadline exceeded — a wakeup was lost`). Notably the single-waiter test PASSED against the same mutant every time: the bug only shows under concurrency.
+Why this way: this is the textbook lost-wakeup pattern; the fix is to make check-and-subscribe atomic.
+
+Line: `defer close(sm.stopped)` in `Run`
+Does: releases every waiter the moment application ends, for any reason.
+Breaks without it: mutant verified, a handler still waiting 3s after the node stopped; graceful shutdown would stall on every in-flight write.
+Why this way: `defer` covers both clean shutdown and fail-stop.
+
+Line: `raftNode.Stop()` before `grpcServer.GracefulStop()` in `main.go`
+Does: lets the applier close `applyCh` → `Run` returns → waiters released → `GracefulStop` has nothing left to wait on.
+Breaks without it: reversed, `GracefulStop` waits on handlers that are waiting on applies that will never happen.
+Why this way: shutdown order has to follow the dependency chain.
+
+### What Breaks and Why
+Milestone 7's two CLAUDE.md-named breaks (remove dedup; followers serve
+reads) run in 7c on the real cluster. Here, each new guard was
+mutation-tested on a scratch copy:
+
+- **Mutant 1: no term check after apply.** Prediction: the leadership-lost
+  test gets OK instead of an error. Observed: confirmed — but only on the
+  second attempt. The first mutation left `term` unused, so the mutant did
+  not compile, the test never ran, and the output was empty. Empty output
+  looked like a pass and wasn't. Lesson: a mutation test must show the
+  mutant compiling before its result means anything.
+- **Mutant 2: check and channel read in two lock acquisitions.**
+  Prediction: lost wakeups. Observed: the concurrency test failed 3/3; the
+  single-waiter test passed 3/3. A test with one waiter cannot catch a race
+  that needs two.
+- **Mutant 3: `Run` never closes `stopped`.** Prediction: waiters hang past
+  shutdown. Observed: both shutdown tests failed, one after a full 3s.
+
+### Real-Binary Verification
+Single-node cluster, real binary, real client over gRPC:
+1. Wrote `a=1`, `b=2`, `c=3`, deleted `b`.
+2. `SIGKILL` — exit status 137.
+3. Data directory afterward: `raft-log.dat` and `raft-state.dat`, no
+   `wal.log`.
+4. Restarted the same binary on the same data: it won term 2, and reads
+   returned `a="1"`, `b` not found, `c="3"`.
+5. `SIGTERM` — exit status 0.
+
+The data came back purely from Raft log replay. One honest limit: the read
+ran a full second after restart, long after replay finished, so this run
+does NOT exercise the transitional `Get`'s pre-replay window.
+
+A first attempt at this run reported exit status 127 for both kills. That
+was a scripting error (the node was started inside a `$(...)` subshell, so
+`wait` couldn't see it), not the node's status; it was re-run correctly
+before recording any numbers.
+
+### Interview Questions and Answers
+Deferred to the end of Milestone 7c (one drill for 7a–7c).
+
+### Git Commit Message
+`feat: route writes through Raft with wait-for-apply and delete the KV WAL`
+
+### Open Questions
+- **`Get` is not linearizable yet.** A cut-off leader serves old data, and
+  a read right after a leader change can miss keys not yet replayed. Both
+  are 7c's ReadIndex.
+- **`Propose` returns `isLeader=false` for two different reasons**: not
+  the leader, or the leader's own log append failed. The handler reports
+  both as "not leader." Correct for the client (try another node), but the
+  disk failure is invisible in the response.
+- **The client only knows one node.** A "not leader" error is retried
+  against the same node. Round-robin failover is 7c.
+- **Every write pays a full round of fsync on a majority before replying.**
+  No batching. Correct baseline; throughput is untested.
+- **`TermAt` is only stable because applied entries are never truncated.**
+  Milestone 8's log compaction removes old entries from the log; the term
+  check must still work after compaction (snapshot metadata must carry the
+  last included term).
+
+---
+
 <!-- All future entries go below this line, in chronological order -->

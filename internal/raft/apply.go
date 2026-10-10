@@ -65,6 +65,19 @@ func (n *Node) runApplier() {
 	}
 }
 
+// TermAt returns the term of the log entry at index, and whether it exists.
+// The KV layer uses it after an entry is applied to confirm the applied
+// entry is the one it proposed: within a term there is one leader, which
+// assigns each index exactly once, so (index, term) identifies an entry
+// uniquely (the Log Matching Property). Stable for any applied index,
+// because applied entries are committed and committed entries are never
+// truncated.
+func (n *Node) TermAt(index uint64) (term uint64, ok bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.log.TermAt(index)
+}
+
 // LastApplied returns the highest index delivered to the state machine.
 func (n *Node) LastApplied() uint64 {
 	n.mu.Lock()

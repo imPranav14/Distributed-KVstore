@@ -13,9 +13,9 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/imPranav14/Distributed-KVstore/internal/dedup"
+	"github.com/imPranav14/Distributed-KVstore/internal/raft"
 	"github.com/imPranav14/Distributed-KVstore/internal/server"
 	"github.com/imPranav14/Distributed-KVstore/internal/store"
-	"github.com/imPranav14/Distributed-KVstore/internal/wal"
 	kvpb "github.com/imPranav14/Distributed-KVstore/proto/kv"
 )
 
@@ -44,18 +44,13 @@ func startTestServerWithInterceptor(t *testing.T, interceptor grpc.UnaryServerIn
 		t.Fatalf("failed to listen: %v", err)
 	}
 
-	w, err := wal.Open(filepath.Join(t.TempDir(), "wal.log"))
-	if err != nil {
-		t.Fatalf("failed to open test WAL: %v", err)
-	}
-	t.Cleanup(func() { _ = w.Close() })
+	kvServer := startSingleNodeRaft(t)
 
 	var opts []grpc.ServerOption
 	if interceptor != nil {
 		opts = append(opts, grpc.UnaryInterceptor(interceptor))
 	}
 	grpcServer := grpc.NewServer(opts...)
-	kvServer := server.NewKVServer(store.NewStore(), dedup.NewTable(), w)
 	kvpb.RegisterKVStoreServer(grpcServer, kvServer)
 
 	go func() {
@@ -65,6 +60,52 @@ func startTestServerWithInterceptor(t *testing.T, interceptor grpc.UnaryServerIn
 	t.Cleanup(grpcServer.Stop)
 
 	return listener.Addr().String()
+}
+
+// startSingleNodeRaft runs a real one-node Raft cluster behind a KVServer
+// and waits for it to elect itself, so every write the client sends goes
+// through propose → commit → apply exactly as it does in production. A
+// single node is its own majority, so writes commit the moment they are
+// proposed and the client tests stay fast.
+//
+// Exits (Rule 5): Cleanup stops the node; its applier then closes applyCh,
+// which ends the state machine's Run goroutine.
+func startSingleNodeRaft(t *testing.T) *server.KVServer {
+	t.Helper()
+	dir := t.TempDir()
+	state, err := raft.LoadState(filepath.Join(dir, "raft-state.dat"))
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	log, err := raft.OpenLog(filepath.Join(dir, "raft-log.dat"))
+	if err != nil {
+		t.Fatalf("OpenLog: %v", err)
+	}
+
+	applyCh := make(chan raft.ApplyMsg)
+	sm := server.NewStateMachine(store.NewStore(), dedup.NewTable())
+	node := raft.NewNode(1, state, log, map[uint64]raft.Peer{}, applyCh)
+
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		_ = sm.Run(applyCh)
+	}()
+	node.Start()
+	t.Cleanup(func() {
+		node.Stop()
+		<-runDone
+		_ = log.Close()
+	})
+
+	deadline := time.Now().Add(3 * time.Second)
+	for node.Role() != raft.Leader {
+		if time.Now().After(deadline) {
+			t.Fatalf("single-node cluster never elected itself")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return server.NewKVServer(node, sm)
 }
 
 // This test checks the invariant that every retry attempt of a SINGLE
