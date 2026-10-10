@@ -88,31 +88,68 @@ type Node struct {
 	nextIndex  map[uint64]uint64
 	matchIndex map[uint64]uint64
 
+	// lastApplied is the highest log index handed to the state machine via
+	// applyCh. Volatile, exactly like commitIndex: a restarted node starts
+	// at 0 and re-applies its committed log from the beginning, which is
+	// what rebuilds the KV store now that it has no WAL of its own. Written
+	// only by the runApplier goroutine; read under mu by anyone.
+	lastApplied uint64
+
+	// applyCh carries committed entries, in index order, to the KV state
+	// machine. This node is its ONLY sender, so runApplier closes it on
+	// exit — which is the signal that ends the consumer's loop.
+	applyCh chan<- ApplyMsg
+
+	// applyNotify wakes runApplier when commitIndex advances. Capacity 1,
+	// written with a non-blocking send: if a wakeup is already pending, a
+	// second one adds nothing, because the applier always drains
+	// everything up to the CURRENT commitIndex rather than one entry per
+	// signal.
+	applyNotify chan struct{}
+
 	stopCh chan struct{} // closed by Stop(); read by run()'s select loop
+}
+
+// ApplyMsg is one committed log entry, delivered to the state machine.
+//
+// An EMPTY Command is a Raft no-op, appended by every new leader. No-ops
+// are delivered rather than filtered out, so the consumer can advance its
+// own applied index past them — see runApplier for why that matters.
+type ApplyMsg struct {
+	Index   uint64
+	Term    uint64
+	Command []byte
 }
 
 // NewNode constructs a Node in the Follower role, matching Raft's own
 // rule that every server begins as a follower on startup. It does not
-// start the background timer loop — call Start() separately, so tests can
+// start the background goroutines — call Start() separately, so tests can
 // exercise handler methods directly without a timer race in the
 // background.
-func NewNode(id uint64, state *State, log *Log, peers map[uint64]Peer) *Node {
+//
+// applyCh receives every committed entry in order once Start() is called.
+// The caller must keep reading it: Raft never blocks on it while holding
+// its lock, but an unread channel does stall application of new entries.
+func NewNode(id uint64, state *State, log *Log, peers map[uint64]Peer, applyCh chan<- ApplyMsg) *Node {
 	n := &Node{
-		id:     id,
-		peers:  peers,
-		state:  state,
-		log:    log,
-		role:   Follower,
-		stopCh: make(chan struct{}),
+		id:          id,
+		peers:       peers,
+		state:       state,
+		log:         log,
+		role:        Follower,
+		applyCh:     applyCh,
+		applyNotify: make(chan struct{}, 1),
+		stopCh:      make(chan struct{}),
 	}
 	n.resetElectionTimerLocked()
 	return n
 }
 
-// Start launches the background timer loop. Its documented exit condition
-// (Rule 5) is stopCh being closed by Stop().
+// Start launches the background timer loop and the applier. Both have the
+// same documented exit condition (Rule 5): stopCh being closed by Stop().
 func (n *Node) Start() {
 	go n.run()
+	go n.runApplier()
 }
 
 // Stop signals the background loop to exit. NOT idempotent — calling it

@@ -1194,4 +1194,180 @@ Overall: 4 strong, 1 needs more depth. A clear improvement on Milestone 5's gap 
 
 ---
 
+## Milestone 7a — Apply Pipeline, Leader No-Op, Replicated Dedup
+Date: 2026-10-10
+
+### The Problem This Solves
+Milestone 6 produced a replicated log that nothing used: committed entries
+never reached any node's KV store, so the three replicas' data stayed
+completely independent. Committing an entry isn't the same as applying it;
+something has to turn committed log entries into store mutations, on every
+node, in the same order, exactly once.
+
+Two problems ride along. Milestone 6's Q3 found that a newly elected leader
+holding only previous-term entries can never commit them (Figure 8 forbids
+it), so after a full restart data sits on every disk and is invisible to
+every reader. And dedup living in one leader's memory fails across leader
+changes: a write that commits on L1 just before L1 dies gets retried
+through L2, which has never seen it, and enters the log twice.
+
+Milestone 7 is split 7a (this entry: apply pipeline, no-op, replicated
+dedup — all testable in-process), 7b (writes through Propose, delete the KV
+WAL), 7c (linearizable reads via ReadIndex, client failover, real-cluster
+verification). The interview drill runs once, at the end of 7c, covering
+the whole milestone.
+
+### The Design Decision Made
+**Apply channel over callback (Choice 1A).** Raft sends `ApplyMsg` on a Go
+channel; the KV layer runs one goroutine that reads it. Rejected: a
+callback passed into `NewNode`, which would run KV logic on Raft's
+goroutines and invite lock-order cycles between `Node.mu` and the store's
+locks. The channel keeps `internal/raft` free of KV knowledge and gives the
+store exactly one writer.
+
+**Dedup moved inside the replicated state machine.** Since every replica
+applies the same log in the same order, every replica builds the same dedup
+table and skips the same duplicates. A retried request may legitimately
+appear in the log twice; the second copy is a no-op everywhere. Side
+effect: replaying the log on restart rebuilds the dedup table, closing
+Milestone 4's "dedup does not survive a crash" open question.
+
+**No-ops are delivered to the state machine, not filtered out by Raft.**
+ReadIndex (7c) will wait for the state machine's applied index to reach
+the read index, which right after an election IS the no-op's index.
+Filtering no-ops would make the first read after every leader change wait
+forever. Raft delivers every index; the state machine decides what to skip.
+
+**Commands encoded with protobuf (`kv.proto`'s `Command`).** A deliberate
+reversal of Milestone 6's reasoning for hand-rolled log framing. Protobuf's
+non-canonical encoding only matters when bytes get re-encoded; a command is
+marshalled exactly once, by the leader, and every replica stores and
+replays those identical bytes. The price is a stricter field-number rule:
+these bytes live in a durable, forever-replayed log.
+
+**`OP_UNSPECIFIED = 0` is reserved and refused at encode time.** proto3
+omits default-valued fields, so a zero-valued Command marshals to zero
+bytes, the exact shape of a no-op. Refusing it keeps the two impossible to
+confuse.
+
+**Fail-stop on an undecodable entry.** Log entries have no checksum, so
+bad bytes may be corruption on this replica's disk alone. Skipping the
+entry would make this replica silently diverge; stopping matches
+CLAUDE.md's crash-stop failure model.
+
+### How It Works — Plain English
+Whenever a node's `commitIndex` rises, Raft drops a token into a size-1
+"wake up" channel. A single applier goroutine wakes, copies every committed
+entry it hasn't delivered yet (under the lock), releases the lock, and
+sends each one down the apply channel in order, recording `lastApplied` as
+it goes. On the other end, `StateMachine.Run` (the only goroutine allowed
+to touch the store) checks each entry arrives at exactly the next index,
+skips no-ops (still counting them as applied), decodes real commands, and
+runs them through the dedup table so a request already applied is ignored.
+
+When a node wins an election, it now writes a no-op in its new term before
+doing anything else. Once that no-op reaches a majority, it's committed,
+and by Figure 8's transitivity every older entry beneath it commits too.
+
+A single-node cluster (allowed by `config.go`) now works: with zero peers
+the node's own vote is a majority, checked before the vote-counting loop.
+
+### Key Invariants
+- INVARIANT (`apply.go`): entries are sent on `applyCh` WITHOUT holding
+  `mu`. Safe only because entries at or below `commitIndex` can never be
+  truncated; uncommitted entries are never copied out.
+- INVARIANT (`apply.go`): exactly one applier goroutine per node, so
+  delivery order is index order with no interleaving possible.
+- INVARIANT (`election.go`): a leader that cannot write its no-op steps
+  down WITHOUT `becomeFollowerLocked`, which would persist `(term, NoVote)`
+  and free the node to vote twice in the current term.
+- INVARIANT (`election.go`): leader state is initialized BEFORE the no-op
+  is appended, so `nextIndex` lands on the no-op itself.
+- INVARIANT (`replication.go`): a follower's `commitIndex` only ever
+  increases. `min(leaderCommit, lastNewEntry)` can land below the current
+  value on a short delayed request, and is then ignored.
+- INVARIANT (`state_machine.go`): entries are applied exactly once, in
+  index order. A gap or repeat is an error, never a silent skip or
+  double-apply.
+- INVARIANT (`state_machine.go`): `encodeCommand` never produces empty
+  bytes; empty means no-op.
+- INVARIANT (`kv.proto`): `Command` field numbers are permanent; existing
+  logs are replayed forever.
+
+### The Lines That Matter Most
+
+Line: `case n.applyCh <- msg:` inside a `select` with `case <-n.stopCh: return`, after `n.mu.Unlock()`
+Does: delivers a committed entry without holding the node's lock, and can still exit while blocked.
+Breaks without it: sending while holding `mu` lets a slow KV consumer block every RequestVote and AppendEntries handler, so the node stops heartbeating and triggers cluster-wide elections because its state machine was busy. Without the `stopCh` arm, Stop leaks the applier forever when nobody is reading (`TestApplier_ExitsOnStopWhileBlockedAndClosesChannel`).
+Why this way: committed entries are immutable, so a copy taken under the lock stays valid after it's released.
+
+Line: `n.role = Follower; n.resetElectionTimerLocked()` (instead of `n.becomeFollowerLocked(...)`) when the no-op write fails
+Does: steps down while leaving the persisted self-vote intact.
+Breaks without it: mutant verified, persisted state became `(1, 0)` instead of `(1, 7)` — the node could grant a second vote in a term it already voted in.
+Why this way: `becomeFollowerLocked` is for ENTERING a new term; here the term isn't changing.
+
+Line: `if newCommitIndex > n.commitIndex { n.commitIndex = newCommitIndex; ... }`
+Does: refuses to move `commitIndex` backward.
+Breaks without it: a latent Milestone 6 bug. A delayed request carrying only entry 3, arriving with `LeaderCommit=6` after the follower had committed through 5, set `commitIndex` to 3 (mutant verified). The M6 test `NeverGoesBackward` only covered a LOWER LeaderCommit, so it never hit this path. In 7a this would have stalled application (`lastApplied` above `commitIndex`).
+Why this way: committed is permanent; the min() is about not exceeding our own log, not about lowering anything.
+
+Line: `if len(peers) == 0 { won := n.becomeLeaderLocked(electionTerm) ... }` in `startElection`
+Does: lets a single node elect itself.
+Breaks without it: a latent Milestone 5 bug — with zero peers the vote-counting loop runs zero times and the majority check is never reached, so the node campaigned forever (mutant verified).
+Why this way: one vote out of one IS a majority; the check just has to happen somewhere the loop can't skip.
+
+Line: `if msg.Index != expected { return fmt.Errorf(...) }` in `StateMachine.apply`
+Does: turns an out-of-order or duplicate delivery into a loud error.
+Breaks without it: a double-apply or skipped entry would make this replica's state differ from the others with no visible symptom.
+Why this way: Raft guarantees order, but this is the one place a violation of that guarantee would become silent data divergence, so it's checked where it would cause harm.
+
+### What Breaks and Why
+No CLAUDE.md-named breaks belong to 7a; Milestone 7's two named breaks
+(remove dedup → retry applied twice; followers serve reads → stale read)
+run in 7c against the real cluster. Instead, each new guard was
+mutation-tested on a scratch copy of the repo, never in the working tree:
+
+- **Mutant 1: commitIndex may move backward** (restores Milestone 6's code).
+  Prediction: the short-delayed-request test fails.
+  Observed: `CommitIndex() = 3, want 5`.
+- **Mutant 2: no zero-peer majority check** (restores Milestone 5's code).
+  Prediction: single-node election never completes.
+  Observed: `role = 1 (Candidate), want Leader`; the no-op test timed out waiting for an ApplyMsg.
+- **Mutant 3: step down via becomeFollowerLocked.**
+  Prediction: the self-vote is erased.
+  Observed: `persisted (term, votedFor) = (1, 0), want (1, 7)`.
+
+Why these matter at a deep level: two of the three were bugs already in
+committed code from earlier milestones, invisible because nothing
+exercised those paths until the apply pipeline depended on them. Building
+the next layer is what exposed them.
+
+### Real-Binary Verification
+Ran the actual node binary as a single-node cluster (empty `PEER_ADDRS`):
+it elected itself at term 1, wrote exactly one 20-byte entry to
+`raft-log.dat` (a header with an empty command — the no-op), and shut down
+with exit code 0. The clean exit exercises the shutdown chain: `Stop` →
+applier closes `applyCh` → `StateMachine.Run` returns.
+
+### Interview Questions and Answers
+Deferred to the end of Milestone 7c, where one drill covers 7a, 7b and 7c
+together — the same pattern as Milestones 3, 4 and 6.
+
+### Git Commit Message
+`feat: add apply pipeline, leader no-op, and replicated dedup state machine`
+
+### Open Questions
+- **Client requests still use the old path.** `main.go` runs the state
+  machine, but its store only receives no-ops until 7b routes writes
+  through `Propose` and deletes the KV WAL. Marked TRANSITIONAL in code.
+- **A decode failure stops the node permanently.** Correct for crash-stop,
+  but there's no automatic recovery; Milestone 8's snapshot transfer could
+  rebuild such a replica.
+- **Restart re-applies the whole log from index 1.** Unbounded until
+  Milestone 8's snapshots.
+- **The applier copies all pending entries in one batch.** Fine at this
+  scale; a very far-behind node would allocate the full backlog at once.
+
+---
+
 <!-- All future entries go below this line, in chronological order -->

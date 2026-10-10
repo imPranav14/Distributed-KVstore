@@ -27,6 +27,16 @@ func (p fakePeer) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesRe
 
 func newTestNode(t *testing.T, id uint64) *Node {
 	t.Helper()
+	node, _ := newTestNodeWithApplyCh(t, id)
+	return node
+}
+
+// newTestNodeWithApplyCh also returns the receive side of the node's apply
+// channel, for tests that check what gets delivered to the state machine.
+// The channel is buffered generously so that tests which do NOT read it
+// never leave the applier blocked mid-send.
+func newTestNodeWithApplyCh(t *testing.T, id uint64) (*Node, <-chan ApplyMsg) {
+	t.Helper()
 	dir := t.TempDir()
 	s, err := LoadState(filepath.Join(dir, "raft-state.dat"))
 	if err != nil {
@@ -37,7 +47,8 @@ func newTestNode(t *testing.T, id uint64) *Node {
 		t.Fatalf("OpenLog: %v", err)
 	}
 	t.Cleanup(func() { _ = l.Close() })
-	return NewNode(id, s, l, map[uint64]Peer{})
+	applyCh := make(chan ApplyMsg, 1024)
+	return NewNode(id, s, l, map[uint64]Peer{}, applyCh), applyCh
 }
 
 // newTestCluster wires n nodes together with fakePeers pointing at each

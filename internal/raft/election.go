@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 
 	raftpb "github.com/imPranav14/Distributed-KVstore/proto/raft"
@@ -78,6 +79,19 @@ func (n *Node) startElection() {
 	// the same values even if the log changes mid-election.
 	lastLogIndex := n.log.LastIndex()
 	lastLogTerm := n.log.LastTerm()
+
+	// A single-node cluster: our own vote is already a majority. This has
+	// to be checked HERE, because with zero peers the vote-counting loop
+	// below runs zero times and its majority check is never reached — the
+	// node would campaign forever and never lead.
+	if len(peers) == 0 {
+		won := n.becomeLeaderLocked(electionTerm)
+		n.mu.Unlock()
+		if won {
+			slog.Info("raft: elected leader (single-node cluster)", "node_id", n.id, "term", electionTerm)
+		}
+		return
+	}
 	n.mu.Unlock()
 
 	slog.Info("raft: starting election", "node_id", n.id, "term", electionTerm, "last_log_index", lastLogIndex, "last_log_term", lastLogTerm)
@@ -126,18 +140,69 @@ func (n *Node) startElection() {
 		stillRelevant := n.role == Candidate && n.state.CurrentTerm() == electionTerm
 		haveMajority := votes > (len(n.peers)+1)/2
 		if stillRelevant && haveMajority {
-			n.role = Leader
-			// Must happen before releasing mu: a concurrent Propose or
-			// replication tick that sees role == Leader would otherwise
-			// read a nil nextIndex/matchIndex map.
-			n.initializeLeaderStateLocked()
+			won := n.becomeLeaderLocked(electionTerm)
 			n.mu.Unlock()
-			slog.Info("raft: elected leader", "node_id", n.id, "term", electionTerm, "votes", votes)
-			n.replicateToAll() // immediately — don't wait for the next tick
+			if won {
+				slog.Info("raft: elected leader", "node_id", n.id, "term", electionTerm, "votes", votes)
+				n.replicateToAll() // immediately — don't wait for the next tick
+			}
 			return
 		}
 		n.mu.Unlock()
 	}
+}
+
+// becomeLeaderLocked transitions to Leader for electionTerm and writes the
+// new term's no-op. Callers must hold mu. Returns false if the no-op could
+// not be written, in which case the node has already stepped back down.
+func (n *Node) becomeLeaderLocked(electionTerm uint64) bool {
+	n.role = Leader
+
+	// Must happen before mu is released: a concurrent Propose or
+	// replication tick that sees role == Leader would otherwise read a nil
+	// nextIndex/matchIndex map. Also deliberately BEFORE the no-op, so
+	// nextIndex lands on the no-op's own index and the first AppendEntries
+	// carries it. In the other order nextIndex would sit one past the
+	// no-op, every follower would reject a prevLogIndex it doesn't have,
+	// and each one would cost a wasted round trip.
+	n.initializeLeaderStateLocked()
+
+	if err := n.appendNoOpLocked(electionTerm); err != nil {
+		slog.Error("raft: won election but could not write no-op; stepping down",
+			"node_id", n.id, "term", electionTerm, "error", err)
+		// INVARIANT: step down WITHOUT becomeFollowerLocked. That helper
+		// persists (term, NoVote), which would erase this node's vote for
+		// itself IN THE CURRENT TERM and leave it free to vote for a
+		// different candidate in the same term — two votes in one term,
+		// exactly the safety violation Milestone 5 exists to prevent. The
+		// persisted vote must stay untouched.
+		n.role = Follower
+		n.resetElectionTimerLocked()
+		return false
+	}
+	return true
+}
+
+// appendNoOpLocked writes an empty entry in the new leader's own term.
+// Callers must hold mu.
+//
+// Why every new leader needs one: a leader may only commit by counting
+// replicas when the entry is from its CURRENT term (Figure 8). A leader
+// elected after a restart may hold nothing but earlier-term entries, so
+// without an entry of its own it cannot commit them — every node would
+// keep the data durably on disk while commitIndex stays at 0 and the
+// store stays empty, until some client happened to write again. Committing
+// this no-op carries every earlier entry with it. ReadIndex (Milestone 7c)
+// depends on it for the same reason: a leader cannot trust its own
+// commitIndex until it has committed something in its own term.
+func (n *Node) appendNoOpLocked(term uint64) error {
+	noOp := &raftpb.LogEntry{Term: term, Index: n.log.LastIndex() + 1, Command: nil}
+	if err := n.log.Append(noOp); err != nil {
+		return fmt.Errorf("raft: failed to append no-op for term %d: %w", term, err)
+	}
+	// Recount for the same single-node reason as Propose.
+	n.advanceCommitIndexLocked()
+	return nil
 }
 
 // AppendEntries handling and the leader's replication loop live in

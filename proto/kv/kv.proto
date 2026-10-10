@@ -49,3 +49,34 @@ message DeleteRequest {
 
 // Empty, same reasoning as PutResponse.
 message DeleteResponse {}
+
+// Command is the payload of one replicated log entry: what the leader
+// proposes and every replica applies to its state machine. It is NOT an RPC
+// message — no service method takes or returns it.
+//
+// INVARIANT: these field numbers are permanent in a stricter sense than the
+// RPC messages above. Commands live in a durable log that is replayed on
+// every restart, forever. Renumbering a field would not merely break old
+// clients — it would make every existing log decode into the wrong fields.
+//
+// Protobuf encoding is not canonical, which is why Milestone 6 hand-rolled
+// the log's own framing. That concern does not apply here: a Command is
+// marshalled exactly once, by the leader, and followers store and replay
+// those identical bytes without ever re-encoding them.
+message Command {
+    enum Op {
+        // INVARIANT: the zero value is never proposed. proto3 omits default
+        // field values when marshalling, so a Command with Op=UNSPECIFIED
+        // and every other field empty marshals to ZERO bytes — which is
+        // exactly how Raft represents a no-op. Reserving 0 is what keeps
+        // "empty command" and "real command" impossible to confuse.
+        OP_UNSPECIFIED = 0;
+        OP_PUT = 1;
+        OP_DELETE = 2;
+    }
+    Op op = 1;
+    string key = 2;
+    string value = 3; // unused for OP_DELETE
+    string client_id = 4;
+    uint64 request_id = 5;
+}

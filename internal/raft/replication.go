@@ -65,7 +65,15 @@ func (n *Node) HandleAppendEntries(req *raftpb.AppendEntriesRequest) *raftpb.App
 	// own log.
 	if req.LeaderCommit > n.commitIndex {
 		indexOfLastNewEntry := req.PrevLogIndex + uint64(len(req.Entries))
-		n.commitIndex = min(req.LeaderCommit, indexOfLastNewEntry)
+		newCommitIndex := min(req.LeaderCommit, indexOfLastNewEntry)
+		// min() can land BELOW our current commitIndex on a request that
+		// delivered fewer entries than we already have committed — the
+		// outer check only compares against LeaderCommit. commitIndex must
+		// never move backward, so only take it if it actually advances.
+		if newCommitIndex > n.commitIndex {
+			n.commitIndex = newCommitIndex
+			n.signalApplierLocked()
+		}
 	}
 
 	return &raftpb.AppendEntriesResponse{Term: n.state.CurrentTerm(), Success: true}
@@ -141,6 +149,13 @@ func (n *Node) Propose(command []byte) (index uint64, term uint64, isLeader bool
 	if err := n.log.Append(&raftpb.LogEntry{Term: term, Index: index, Command: command}); err != nil {
 		return 0, 0, false
 	}
+
+	// Recount immediately. With peers this commits nothing yet — no
+	// follower has the entry — but in a single-node cluster (permitted by
+	// config.go for local testing) the leader alone IS the majority, and
+	// with no peers there is never a replication response to trigger a
+	// recount. Without this line a single node would never commit anything.
+	n.advanceCommitIndexLocked()
 	return index, term, true
 }
 
@@ -297,6 +312,7 @@ func (n *Node) advanceCommitIndexLocked() {
 
 		if replicas >= majority {
 			n.commitIndex = index
+			n.signalApplierLocked()
 			return
 		}
 	}

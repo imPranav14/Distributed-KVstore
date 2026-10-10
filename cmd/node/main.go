@@ -120,7 +120,28 @@ func main() {
 		os.Exit(1)
 	}
 
-	raftNode := raft.NewNode(uint64(cfg.NodeID), raftState, raftLog, peers)
+	// The replicated state machine, fed by committed Raft entries. Its store
+	// starts EMPTY and is rebuilt by re-applying the committed log from index
+	// 1 — that is its entire recovery path.
+	//
+	// TRANSITIONAL (Milestone 7a only): client requests still go through
+	// kvServer's own WAL-backed store below, so this state machine currently
+	// receives nothing but no-ops. Milestone 7b routes writes through
+	// raftNode.Propose, points kvServer at this store, and deletes the WAL.
+	applyCh := make(chan raft.ApplyMsg)
+	stateMachine := server.NewStateMachine(store.NewStore(), dedup.NewTable())
+	raftNode := raft.NewNode(uint64(cfg.NodeID), raftState, raftLog, peers, applyCh)
+
+	// Exit (Rule 5): Run returns when raftNode.Stop() makes the applier
+	// close applyCh. An apply ERROR is fatal: the state machine fail-stops on
+	// an entry it cannot decode, and a node whose state might have diverged
+	// from the other replicas must not keep serving.
+	go func() {
+		if err := stateMachine.Run(applyCh); err != nil {
+			slog.Error("node: state machine failed; exiting", "error", err)
+			os.Exit(1)
+		}
+	}()
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
 	if err != nil {
