@@ -169,6 +169,11 @@ func (n *Node) Role() Role {
 	return n.role
 }
 
+// ID returns this node's ID. Immutable after construction, so no lock.
+func (n *Node) ID() uint64 {
+	return n.id
+}
+
 // CommitIndex returns the highest log index known to be committed.
 func (n *Node) CommitIndex() uint64 {
 	n.mu.Lock()

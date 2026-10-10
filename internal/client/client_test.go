@@ -289,3 +289,32 @@ func TestPut_ContextCancelled_StopsRetryingEarly(t *testing.T) {
 		t.Fatalf("Put took %v after context cancellation, want it to stop quickly instead of running the full backoff schedule", elapsed)
 	}
 }
+
+// This test checks round-robin failover: with the FIRST address dead, the
+// client must move on to the next node instead of retrying the dead one
+// until it gives up. Before Milestone 7c a client knew exactly one node, so
+// losing it — or reaching a follower — meant failing outright.
+func TestClient_FailsOverPastDeadNode(t *testing.T) {
+	addr := startTestServer(t)
+	c, err := NewClient("127.0.0.1:1", addr) // nothing listens on port 1
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	ctx := context.Background()
+
+	if err := c.Put(ctx, "x", "5"); err != nil {
+		t.Fatalf("Put with the first node dead: %v, want failover to the second", err)
+	}
+	value, found, err := c.Get(ctx, "x")
+	if err != nil || !found || value != "5" {
+		t.Fatalf("Get after failover = (%q, %v, %v), want (\"5\", true, nil)", value, found, err)
+	}
+}
+
+// This test checks that NewClient refuses an empty address list rather than
+// building a client that would panic on its first call.
+func TestNewClient_RequiresAtLeastOneTarget(t *testing.T) {
+	if _, err := NewClient(); err == nil {
+		t.Fatalf("NewClient() with no targets: err = nil, want an error")
+	}
+}

@@ -6,6 +6,8 @@ services:
       - PEER_ADDRS=2=node2:50051,3=node3:50051
       - GRPC_PORT=50051
       - DATA_DIR=/data/node1
+    ports:
+      - "50051:50051"  # host:container — each node needs its own host port
     volumes:
       - node1-data:/data/node1
 
@@ -16,6 +18,8 @@ services:
       - PEER_ADDRS=1=node1:50051,3=node3:50051
       - GRPC_PORT=50051
       - DATA_DIR=/data/node2
+    ports:
+      - "50052:50051"  # host:container — each node needs its own host port
     volumes:
       - node2-data:/data/node2
 
@@ -26,6 +30,8 @@ services:
       - PEER_ADDRS=1=node1:50051,2=node2:50051
       - GRPC_PORT=50051
       - DATA_DIR=/data/node3
+    ports:
+      - "50053:50051"  # host:container — each node needs its own host port
     volumes:
       - node3-data:/data/node3
 

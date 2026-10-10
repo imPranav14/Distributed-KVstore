@@ -1530,4 +1530,167 @@ Deferred to the end of Milestone 7c (one drill for 7a–7c).
 
 ---
 
+## Milestone 7c — Linearizable Reads (ReadIndex) and Client Failover
+Date: 2026-10-11
+
+### The Problem This Solves
+After 7b, writes were correct but reads were not linearizable. Two gaps:
+a leader cut off by a partition still believes it leads and answers from
+data a newer leader has changed; and a new leader's `commitIndex` can sit
+below entries the previous leader already committed, so a read right after
+an election could miss a write that had already returned OK.
+Separately, the client knew one address: a "not leader" reply or a dead
+node meant failure.
+
+### The Design Decision Made
+**ReadIndex (Choice 2B)** over reads through the log (2A: every GET pays a
+majority fsync) and lease reads (2C: no round trip, but correctness depends
+on bounded clock drift; a GC pause or clock jump breaks it). Cost: one
+round trip to a majority per read, no disk write.
+
+**Acknowledgement = `resp.Term == term`, not `resp.Success`.** The
+confirmation round needs proof that a majority still accepts this leader's
+term, not proof that their logs match. `replicateToPeer` now returns that
+fact; `replicateToAll` ignores it and `ReadIndex` counts it, so one code
+path serves both replication and confirmation.
+
+**Reads before the first current-term commit fail fast** with
+`ErrNotReadyForReads` rather than waiting inside Raft. The client retries.
+Makes the brief post-election read pause visible rather than hidden.
+
+**Round-robin failover (Choice 3A)** over leader hints (3B: needs new proto
+fields, and a hint can itself be stale). `NewClient` is variadic, so every
+existing caller compiles unchanged.
+
+**Stale-read demonstration in-process**, on a fake network a test can
+partition, because Docker can't produce a partition reliably. Two permanent
+tests came out of it.
+
+### How It Works — Plain English
+A `Get` asks Raft for a read index. Raft refuses if this node isn't leader,
+or if it hasn't yet committed anything in its own term (its no-op is still
+in flight). Otherwise it notes its current commit index, then sends one
+round of AppendEntries and counts replies that carry its own term. Once a
+majority (itself included) has answered that way, no newer leader can have
+been elected before the read began, because that leader would have needed
+a majority and one of our responders would have told us about the higher
+term. The handler then waits until the local state machine has applied
+through the read index and reads the local store.
+
+The client holds a connection to every node. After any failed attempt it
+moves to the next node; the request ID stays fixed across all of them.
+
+### Key Invariants
+- INVARIANT (`read.go`): read only after this leader has committed an entry
+  from its own term.
+- INVARIANT (`read.go`): the confirmation round runs after `readIndex` is
+  recorded, and needs acknowledgements of the term from a majority.
+- INVARIANT (`replication.go`): a reply counts as a leadership
+  acknowledgement iff `resp.Term == term`, regardless of `Success`.
+- INVARIANT (`kv_server.go`): `Get` waits until the state machine has
+  applied through `readIndex` before reading.
+- INVARIANT (`client.go`): every attempt of one logical call, on any node,
+  carries the same request ID.
+
+### The Lines That Matter Most
+
+Line: `acknowledgedTerm = resp.Term == term`
+Does: counts a reply as confirming leadership based on term alone.
+Breaks without it: mutant verified, counting only `Success` made ReadIndex fail with "1 of 3 nodes acknowledged term 1, need 2" when both followers were behind.
+Why this way: leadership confirmation and log agreement are different questions (Q3).
+
+Line: `if commitTerm != currentTerm { return 0, ErrNotReadyForReads }`
+Does: blocks reads until this leader's own-term entry has committed.
+Breaks without it: mutant verified, ReadIndex returned an index with no current-term commit, where commitIndex can lag the previous leader's commits.
+Why this way: Figure 8 forbids committing old-term entries directly, so a new leader's commitIndex is unreliable until its no-op commits.
+
+Line: `if err := n.confirmLeadership(ctx, currentTerm, peers); err != nil`
+Does: the majority round that defeats a cut-off leader.
+Breaks without it: Break 2b, below.
+Why this way: a leader's own belief that it leads is not evidence.
+
+Line: `c.current = (c.current + 1) % len(c.stubs)`
+Does: moves to the next node after any failed attempt.
+Breaks without it: a client stuck on a follower or a dead node can never succeed.
+Why this way: "not leader," "dead," and "timed out" all mean the same thing to the client.
+
+### What Breaks and Why
+
+**Break 1 (named by CLAUDE.md): remove the duplicate detection table.**
+Prediction: a retry logged twice is applied twice.
+Observed: three tests failed. Over gRPC: `value = "second-should-be-ignored", want "first"`. Across a leader change: `x = "a", want "b"` — the retry erased client 2's newer write. Replica determinism: `z = "overwritten"`.
+Why wrong at a deep level: without replicated dedup, "the client retries with the same ID" protects nothing; the log is allowed to hold a request twice, so something at apply time has to recognise it.
+
+**Break 2 (named by CLAUDE.md): followers serve reads from local state.**
+Prediction: a stale read.
+Observed: both partition tests failed with the stale value. Cut-off follower: `served x="1" — a stale read after x=2 was acknowledged`. Cut-off old leader: the same.
+
+**Break 2b: 7b's read rule (leader-only, no confirmation round).**
+Observed: the follower test PASSED; the old-leader test FAILED with `x="1"` after the new leader had committed `x=2`. The strongest result of the milestone: leader-only reads close the follower gap and leave the stale-leader gap fully open. The confirmation round is the part doing the work.
+
+**Mutants (both caught):** counting only `Success` (above); removing the
+current-term precondition (above).
+
+**The compile check earned its keep.** After 7b's silent non-compiling
+mutant, every mutant was vetted before its result was trusted. The first
+attempt at Breaks 2 and 2b did not compile (an unused `err`); without the
+check they would have printed nothing and looked like passes, exactly as in
+7b. Fixed and re-run.
+
+### Real-Cluster Verification — Deferred
+The planned 3-node Docker run (failover across a stopped leader, revival,
+and a full-cluster stop/start reproducing Milestone 6's Q3 power-loss
+scenario for real) was skipped at the user's request, to be done later.
+What IS verified: every behaviour above in-process with real Raft nodes,
+including leader change and partition; the full-restart no-op path via
+`TestNoOp_NewLeaderCommitsPreviousTermEntriesWithoutClientWrites`; and
+single-node crash recovery on the real binary (7b).
+
+### Interview Questions and Answers (all of Milestone 7)
+
+Q1: PUT(x,1) from c1 (req 5) commits at index 7 and is applied; the leader crashes before replying. c2's PUT(x,2) commits at 8; c1's retry is proposed at 9. Final x, what the retry receives, and every mechanism required.
+A: x=2 everywhere; the retry gets OK; mechanisms: WAL and durable Raft state, election and log safety, replication and commitment, ordered application, replicated dedup, stable client/request IDs, write-handler index/term verification.
+Assessment: parts 1–2 strong; part 3 needs more depth.
+What was missing: mechanisms tied to what each prevents here, not categories. Election restriction (or index 7 is lost and replicas diverge); single in-order applier; dedup inside the state machine (handler dedup died with the old leader); requestID <= lastSeen; lastSeen only on success; same request ID across failover; term check at 9; WaitForApplied. Also "WAL" now reads as the Milestone 4 WAL deleted in 7b. Key insight missed: index 9 IS applied, as a skip; the handler can't tell executed from deduplicated and doesn't need to.
+
+Q2: Prove the term check can't produce a false OK; name the properties. Could a node re-lead in the same term after the no-op failure step-down, and would the proof survive?
+A: Log Matching makes same index+term the same entry; relies on Election Safety, Leader Append-Only, Log Matching, State Machine Safety. Correct election rules prevent a conflicting leader in the same term; two conflicting leaders in one term would break the proof.
+Assessment: needs more depth.
+What was missing: how the properties combine — only the term-T leader creates term-T entries (Election Safety); it assigns index i at most once in T (Leader Append-Only); copies are unchanged (Log Matching); applied implies committed implies stable. And the trap answered a different hypothetical: the question was the SAME node re-leading. It can't (startElection increments the term first); and even if it could, it would still be the only creator of term-T entries and nothing in term T could truncate its index-i entry, so the proof survives.
+
+Q3: ReadIndex counts rejected AppendEntries as acknowledgements; advanceCommitIndex counts only accepted ones. Inconsistent?
+A: Different questions: whether a majority acknowledges the leader's term, vs whether the entry has been replicated.
+Assessment: strong.
+What could be sharpened: what breaks if swapped. Strict rule in ReadIndex is safe but blocks reads on laggards (the mutant). Loose rule in commit is unsafe: commits entries that live on one machine (Milestone 6's lagging-follower break).
+
+Q4: Snapshots save only the KV map. What breaks, on which nodes, why worse than a double apply?
+A: Dedup metadata lost; a restored replica re-executes a retry while others skip it; replicas diverge; fix: snapshot KV, dedup, last-included index and term.
+Assessment: strong.
+What could be sharpened: with only PUT/DELETE the divergence needs an intervening write (Q1's shape), not an append operation the system doesn't have. The sneakiest node is a lagging follower receiving InstallSnapshot, which never crashed. Worse than double-apply because it's silent, permanent, the client got OK, and reads depend on which node leads.
+
+Q5: Construct the lost wakeup; why the single-waiter test passed against it; which of the 200 waiters get stuck.
+A: Exact interleaving (check 11, apply 12 closes A and arms B, waiter grabs B and sleeps). Single-waiter test may never hit the window. Waiters that grab the new channel stay stuck until another apply, cancellation or shutdown.
+Assessment: part 1 strong; parts 2–3 need more depth.
+What was missing: part 2 is structural, not luck — applies are 20–50ms apart against a 1ms gap, so the waiter is always parked before an apply happens. Part 3: the next apply rescues a waiter that lost its wakeup, so failures cluster at the HIGHEST indices, whose missed apply has no successor.
+
+Overall: 2 strong, 3 need more depth. Every conclusion was correct; precision dropped exactly where the questions demanded it (named mechanisms, precise reasons, which waiters) — the Milestone 5 pattern returning after a stronger Milestone 6.
+
+### Git Commit Message
+`feat: add linearizable reads via ReadIndex and round-robin client failover`
+
+### Open Questions
+- **Real 3-node Docker verification is deferred**, including the
+  full-cluster stop/start (Milestone 6 Q3) on real containers.
+- **Every read costs a majority round trip.** No batching: N concurrent
+  reads run N confirmation rounds where one would do.
+- **Reads fail for a moment after every election** (`ErrNotReadyForReads`)
+  until the no-op commits; the client absorbs it with retries.
+- **Round-robin rotates even when the leader is merely slow.** A
+  DeadlineExceeded from the actual leader sends the next attempt to a
+  follower, costing extra hops. Leader hints would fix it.
+- **Snapshots must carry the dedup table and last-included index/term**
+  (Q4, and 7b's `TermAt` question) or replicas diverge.
+
+---
+
 <!-- All future entries go below this line, in chronological order -->

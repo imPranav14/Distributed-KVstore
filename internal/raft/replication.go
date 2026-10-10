@@ -201,11 +201,18 @@ func (n *Node) replicateToAll() {
 
 // replicateToPeer ships whatever this peer is missing, backing up on
 // rejection until it finds where the two logs still agree.
-func (n *Node) replicateToPeer(peerID uint64, peer Peer, term uint64) {
+//
+// Returns acknowledgedTerm: whether the peer answered and still accepts us
+// as leader of term — i.e. replied with resp.Term == term. That is
+// deliberately NOT resp.Success. Success=false only means the peer's log
+// didn't match at prevLogIndex; the peer still accepted our term and reset
+// its election timer. ReadIndex counts these acknowledgements to confirm
+// leadership; replicateToAll ignores them.
+func (n *Node) replicateToPeer(peerID uint64, peer Peer, term uint64) (acknowledgedTerm bool) {
 	n.mu.Lock()
 	if n.role != Leader || n.state.CurrentTerm() != term {
 		n.mu.Unlock()
-		return
+		return false
 	}
 	nextIndex := n.nextIndex[peerID]
 	prevLogIndex := nextIndex - 1
@@ -229,7 +236,7 @@ func (n *Node) replicateToPeer(peerID uint64, peer Peer, term uint64) {
 		// A dead or slow peer simply isn't updated this round. The next
 		// tick retries — Raft's own cadence is the retry mechanism, which
 		// is why raftPeerClient deliberately has no retry logic of its own.
-		return
+		return false
 	}
 
 	n.mu.Lock()
@@ -237,15 +244,20 @@ func (n *Node) replicateToPeer(peerID uint64, peer Peer, term uint64) {
 
 	if resp.Term > n.state.CurrentTerm() {
 		n.becomeFollowerLocked(resp.Term)
-		return
+		return false
 	}
+
+	// Answered with our own term: this peer accepts us as leader of term,
+	// whatever happens to its log below. A peer can't answer with a LOWER
+	// term — receiving our request makes it adopt ours.
+	acknowledgedTerm = resp.Term == term
 
 	// Discard a response that belongs to an election we have since moved
 	// past — same stale-result reasoning as startElection's relevance
 	// check. Acting on it would update replication state for a term we are
 	// no longer leading.
 	if n.role != Leader || n.state.CurrentTerm() != term {
-		return
+		return false
 	}
 
 	if resp.Success {
@@ -258,7 +270,7 @@ func (n *Node) replicateToPeer(peerID uint64, peer Peer, term uint64) {
 		}
 		n.nextIndex[peerID] = n.matchIndex[peerID] + 1
 		n.advanceCommitIndexLocked()
-		return
+		return acknowledgedTerm
 	}
 
 	// Rejected: our guess about where this follower's log ends was too
@@ -269,6 +281,7 @@ func (n *Node) replicateToPeer(peerID uint64, peer Peer, term uint64) {
 	if n.nextIndex[peerID] > 1 {
 		n.nextIndex[peerID]--
 	}
+	return acknowledgedTerm
 }
 
 // advanceCommitIndexLocked raises commitIndex to the highest entry that is

@@ -33,24 +33,34 @@ const (
 // dedup entry silently supersede the other's; the design itself, not just
 // this struct, is inherently single-flight.
 type Client struct {
-	stub          kvpb.KVStoreClient
+	// stubs holds one connection per cluster node. current is the node the
+	// next attempt goes to — this client's best guess at the leader.
+	stubs   []kvpb.KVStoreClient
+	current int
+
 	clientID      string
 	nextRequestID uint64
 }
 
-// NewClient dials target (e.g. "localhost:50051") and returns a ready-to-use
-// Client with a freshly generated ClientID. No TLS: out of scope per
+// NewClient dials every target (e.g. "localhost:50051", "localhost:50052")
+// and returns a ready-to-use Client with a freshly generated ClientID.
+// Dialing is lazy: no node needs to be up yet. No TLS: out of scope per
 // CLAUDE.md's explicit project boundaries.
-func NewClient(target string) (*Client, error) {
-	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, fmt.Errorf("client: failed to dial %s: %w", target, err)
+func NewClient(targets ...string) (*Client, error) {
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("client: no target addresses given")
 	}
 
-	return &Client{
-		stub:     kvpb.NewKVStoreClient(conn),
-		clientID: uuid.NewString(),
-	}, nil
+	stubs := make([]kvpb.KVStoreClient, 0, len(targets))
+	for _, target := range targets {
+		conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			return nil, fmt.Errorf("client: failed to dial %s: %w", target, err)
+		}
+		stubs = append(stubs, kvpb.NewKVStoreClient(conn))
+	}
+
+	return &Client{stubs: stubs, clientID: uuid.NewString()}, nil
 }
 
 // Put stores value at key, retrying on failure. requestID is allocated once
@@ -61,8 +71,8 @@ func (c *Client) Put(ctx context.Context, key, value string) error {
 	requestID := c.nextRequestID
 	c.nextRequestID++
 
-	return c.retryWithBackoff(ctx, func(attemptCtx context.Context) error {
-		_, err := c.stub.Put(attemptCtx, &kvpb.PutRequest{
+	return c.retryWithBackoff(ctx, func(attemptCtx context.Context, stub kvpb.KVStoreClient) error {
+		_, err := stub.Put(attemptCtx, &kvpb.PutRequest{
 			Key: key, Value: value, ClientId: c.clientID, RequestId: requestID,
 		})
 		return err
@@ -75,8 +85,8 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 	requestID := c.nextRequestID
 	c.nextRequestID++
 
-	return c.retryWithBackoff(ctx, func(attemptCtx context.Context) error {
-		_, err := c.stub.Delete(attemptCtx, &kvpb.DeleteRequest{
+	return c.retryWithBackoff(ctx, func(attemptCtx context.Context, stub kvpb.KVStoreClient) error {
+		_, err := stub.Delete(attemptCtx, &kvpb.DeleteRequest{
 			Key: key, ClientId: c.clientID, RequestId: requestID,
 		})
 		return err
@@ -88,9 +98,9 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 // and always safe to retry.
 func (c *Client) Get(ctx context.Context, key string) (value string, found bool, err error) {
 	var resp *kvpb.GetResponse
-	err = c.retryWithBackoff(ctx, func(attemptCtx context.Context) error {
+	err = c.retryWithBackoff(ctx, func(attemptCtx context.Context, stub kvpb.KVStoreClient) error {
 		var rpcErr error
-		resp, rpcErr = c.stub.Get(attemptCtx, &kvpb.GetRequest{Key: key})
+		resp, rpcErr = stub.Get(attemptCtx, &kvpb.GetRequest{Key: key})
 		return rpcErr
 	})
 	if err != nil {
@@ -99,23 +109,36 @@ func (c *Client) Get(ctx context.Context, key string) (value string, found bool,
 	return resp.Value, resp.Found, nil
 }
 
-// retryWithBackoff runs fn, retrying with exponential backoff (100ms, 200ms,
-// 400ms... capped at maxBackoff) on failure, up to maxAttempts. Each
-// attempt gets its own perAttemptTimeout derived from ctx, so a single
-// hung attempt can't block forever. If ctx is cancelled while waiting
-// between attempts, retryWithBackoff stops immediately instead of blindly
-// finishing out maxAttempts.
-func (c *Client) retryWithBackoff(ctx context.Context, fn func(context.Context) error) error {
+// retryWithBackoff runs fn against one node at a time, retrying with
+// exponential backoff (100ms, 200ms, 400ms... capped at maxBackoff) on
+// failure, up to maxAttempts. Each attempt gets its own perAttemptTimeout
+// derived from ctx, so a single hung attempt can't block forever. If ctx is
+// cancelled while waiting between attempts, retryWithBackoff stops
+// immediately instead of blindly finishing out maxAttempts.
+//
+// Failover is round-robin: after ANY failed attempt, the next attempt goes
+// to the next node. A "not leader" reply, a dead node and a timeout all
+// mean the same thing to the client — try someone else. With three nodes
+// that is at most two wasted hops to reach the leader. A successful node is
+// kept for the next call.
+//
+// INVARIANT: every attempt of one logical call — including attempts that
+// land on DIFFERENT nodes — carries the same request ID, because fn closes
+// over it. That is what makes failover safe for writes: if an attempt that
+// "failed" (timed out) actually committed, the replicated dedup table on
+// every node skips the retry.
+func (c *Client) retryWithBackoff(ctx context.Context, fn func(context.Context, kvpb.KVStoreClient) error) error {
 	var lastErr error
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		attemptCtx, cancel := context.WithTimeout(ctx, perAttemptTimeout)
-		lastErr = fn(attemptCtx)
+		lastErr = fn(attemptCtx, c.stubs[c.current])
 		cancel()
 
 		if lastErr == nil {
 			return nil
 		}
+		c.current = (c.current + 1) % len(c.stubs)
 
 		if attempt == maxAttempts-1 {
 			break

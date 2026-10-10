@@ -45,20 +45,52 @@ func NewKVServer(node *raft.Node, sm *StateMachine) *KVServer {
 	return &KVServer{raftNode: node, stateMachine: sm}
 }
 
-// Get reads a key from the replicated store, on the leader only.
+// Get performs a linearizable read: the value returned reflects every write
+// that completed before Get was called, on any node.
 //
-// TRANSITIONAL (Milestone 7b): this is NOT yet linearizable. Two known
-// gaps, both closed by Milestone 7c's ReadIndex:
-//   - A stale leader, cut off by a partition, still believes it is leader
-//     and keeps answering from data that a newer leader has since changed.
-//   - Right after a leader change, the new leader may not have finished
-//     replaying its log yet, so a key that exists can read as not found.
+// Neither "read on any node" nor "read on whoever believes it's leader" is
+// enough. A follower can be behind. A leader cut off by a partition still
+// believes it leads while a newer leader accepts writes it never sees.
+// ReadIndex closes both: it confirms with a majority that this node is
+// still leader, and returns the commit index to wait for. Cost: one round
+// trip to a majority, no disk write.
 func (s *KVServer) Get(ctx context.Context, req *kvpb.GetRequest) (*kvpb.GetResponse, error) {
-	if s.raftNode.Role() != raft.Leader {
-		return nil, status.Error(codes.Unavailable, "not leader")
+	waitCtx, cancel := context.WithTimeout(ctx, applyWaitTimeout)
+	defer cancel()
+
+	readIndex, err := s.raftNode.ReadIndex(waitCtx)
+	if err != nil {
+		return nil, readError(err)
 	}
+
+	// The commit index is known; this node's state machine may not have
+	// applied that far yet. Reading before it does could miss a write that
+	// is committed but not yet applied locally.
+	if err := s.stateMachine.WaitForApplied(waitCtx, readIndex); err != nil {
+		if errors.Is(err, errStateMachineStopped) {
+			return nil, status.Error(codes.Unavailable, "node is shutting down")
+		}
+		return nil, status.FromContextError(err).Err()
+	}
+
 	value, found := s.stateMachine.Get(req.Key)
 	return &kvpb.GetResponse{Value: value, Found: found}, nil
+}
+
+// readError maps a ReadIndex failure to a gRPC status. Every failure that
+// another node (or a moment's wait) might fix is Unavailable, which the
+// client treats as "try the next node."
+func readError(err error) error {
+	switch {
+	case errors.Is(err, raft.ErrNotLeader):
+		return status.Error(codes.Unavailable, "not leader")
+	case errors.Is(err, raft.ErrNotReadyForReads):
+		return status.Error(codes.Unavailable, "leader not ready for reads yet")
+	case errors.Is(err, raft.ErrLeadershipNotConfirmed):
+		return status.Errorf(codes.Unavailable, "leadership not confirmed: %v", err)
+	default:
+		return status.FromContextError(err).Err()
+	}
 }
 
 // Put replicates a write through Raft and replies once it is applied.
