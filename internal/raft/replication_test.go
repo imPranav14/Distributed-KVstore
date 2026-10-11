@@ -287,7 +287,7 @@ func TestAppendEntries_EntriesAreDurableBeforeSuccess(t *testing.T) {
 
 	// Reopen the log file independently: if Success was returned before the
 	// fsync, the entry might not be on disk at all.
-	reopened, err := OpenLog(n.log.file.Name(), 0, 0)
+	reopened, err := OpenLog(n.log.file.Name(), n.log.snapshotPath)
 	if err != nil {
 		t.Fatalf("reopen log: %v", err)
 	}

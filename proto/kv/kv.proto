@@ -80,3 +80,18 @@ message Command {
     string client_id = 4;
     uint64 request_id = 5;
 }
+
+// KVSnapshot is the state machine's complete state, as stored in a Raft
+// snapshot's opaque Data. Like Command, it is not an RPC message.
+//
+// INVARIANT: the dedup table is part of the snapshot, not just the KV map.
+// A replica restored from a snapshot without it forgets which requests it
+// has already applied; a retry whose first copy was folded into the
+// snapshot and whose second copy is still in the log would then be applied
+// again on THAT replica only — the other replicas skip it, and the cluster
+// silently diverges (Milestone 7, interview Q4).
+message KVSnapshot {
+    map<string, string> data = 1;
+    // client ID -> highest request ID applied for that client.
+    map<string, uint64> last_request_by_client = 2;
+}

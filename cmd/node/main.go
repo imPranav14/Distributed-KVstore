@@ -58,13 +58,12 @@ func main() {
 	}
 
 	raftLogPath := filepath.Join(cfg.DataDir, "raft-log.dat")
-	// TRANSITIONAL (Milestone 8a): no snapshot base yet. Nothing in 8a ever
-	// writes a snapshot, so (0, 0) is exact. Milestone 8b loads the snapshot
-	// file here and passes its index and term — and must, in the SAME change,
-	// restore the state machine from it. Passing a non-zero base without that
-	// restore would start the store empty while the log skips everything the
-	// snapshot covered: silent loss of all of it.
-	raftLog, err := raft.OpenLog(raftLogPath, 0, 0)
+	// OpenLog loads the snapshot too, so the log's starting point and the
+	// snapshot can never be opened out of step. The state machine is
+	// restored from that same snapshot below: the applier delivers it before
+	// any entry, so the store never runs with the log's base but without the
+	// data the snapshot holds.
+	raftLog, err := raft.OpenLog(raftLogPath, filepath.Join(cfg.DataDir, "snapshot.dat"))
 	if err != nil {
 		slog.Error("node: failed to open raft log", "path", raftLogPath, "error", err)
 		os.Exit(1)
@@ -85,13 +84,14 @@ func main() {
 	}
 
 	// The replicated state machine starts EMPTY — store and dedup table
-	// both — and is rebuilt by re-applying the committed log from index 1.
-	// That is its entire recovery path. Dedup state is now replicated and
-	// replayed along with the data, so it survives restarts (Milestone 4's
-	// open question, closed in 7a).
+	// both. On restart the applier first delivers the snapshot (if any),
+	// then the committed log after it: that is the entire recovery path.
+	//
+	// The node is built first because the state machine snapshots through
+	// it once the log passes SNAPSHOT_THRESHOLD_BYTES.
 	applyCh := make(chan raft.ApplyMsg)
-	stateMachine := server.NewStateMachine(store.NewStore(), dedup.NewTable())
 	raftNode := raft.NewNode(uint64(cfg.NodeID), raftState, raftLog, peers, applyCh)
+	stateMachine := server.NewStateMachine(store.NewStore(), dedup.NewTable(), raftNode, cfg.SnapshotThresholdBytes)
 
 	// Exit (Rule 5): Run returns when raftNode.Stop() makes the applier
 	// close applyCh. An apply ERROR is fatal: the state machine fail-stops on

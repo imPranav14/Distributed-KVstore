@@ -13,7 +13,7 @@ import (
 func fiveEntryLog(t *testing.T) (*Log, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "raft-log.dat")
-	l, err := OpenLog(path, 0, 0)
+	l, err := OpenLog(path, path+".snapshot")
 	if err != nil {
 		t.Fatalf("OpenLog: %v", err)
 	}
@@ -40,7 +40,7 @@ func commands(entries []*raftpb.LogEntry) []string {
 func TestLog_Compact_KeepsSuffixAndReportsBoundary(t *testing.T) {
 	l, _ := fiveEntryLog(t)
 
-	if err := l.Compact(3, 2); err != nil {
+	if err := l.InstallSnapshot(&Snapshot{LastIncludedIndex: 3, LastIncludedTerm: 2}); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 
@@ -75,7 +75,7 @@ func TestLog_Compact_KeepsSuffixAndReportsBoundary(t *testing.T) {
 // were committed. The election restriction would be silently off.
 func TestLog_FullyCompactedLogStillRefusesStaleCandidates(t *testing.T) {
 	l, _ := fiveEntryLog(t)
-	if err := l.Compact(5, 3); err != nil {
+	if err := l.InstallSnapshot(&Snapshot{LastIncludedIndex: 5, LastIncludedTerm: 3}); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 
@@ -108,7 +108,7 @@ func TestHandleRequestVote_FullyCompactedNodeRefusesLongStaleCandidate(t *testin
 		&raftpb.LogEntry{Term: 4, Index: 1, Command: []byte("x")},
 		&raftpb.LogEntry{Term: 4, Index: 2, Command: []byte("y")},
 	)
-	if err := n.log.Compact(2, 4); err != nil {
+	if err := n.log.InstallSnapshot(&Snapshot{LastIncludedIndex: 2, LastIncludedTerm: 4}); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 
@@ -122,7 +122,7 @@ func TestHandleRequestVote_FullyCompactedNodeRefusesLongStaleCandidate(t *testin
 // contiguously afterwards, across a restart with the snapshot as base.
 func TestLog_Compact_SurvivesReopenAndAcceptsAppends(t *testing.T) {
 	l, path := fiveEntryLog(t)
-	if err := l.Compact(3, 2); err != nil {
+	if err := l.InstallSnapshot(&Snapshot{LastIncludedIndex: 3, LastIncludedTerm: 2}); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 	if err := l.Append(entry(3, 6, "f")); err != nil {
@@ -130,7 +130,7 @@ func TestLog_Compact_SurvivesReopenAndAcceptsAppends(t *testing.T) {
 	}
 	l.Close()
 
-	reopened, err := OpenLog(path, 3, 2)
+	reopened, err := OpenLog(path, path+".snapshot")
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestLog_Compact_SurvivesReopenAndAcceptsAppends(t *testing.T) {
 func TestLog_Compact_TermMismatchDiscardsEverything(t *testing.T) {
 	l, _ := fiveEntryLog(t)
 
-	if err := l.Compact(4, 9); err != nil { // our entry 4 has term 2, not 9
+	if err := l.InstallSnapshot(&Snapshot{LastIncludedIndex: 4, LastIncludedTerm: 9}); err != nil { // our entry 4 has term 2, not 9
 		t.Fatalf("Compact: %v", err)
 	}
 
@@ -166,7 +166,7 @@ func TestLog_Compact_TermMismatchDiscardsEverything(t *testing.T) {
 func TestLog_Compact_BeyondEndDiscardsEverything(t *testing.T) {
 	l, _ := fiveEntryLog(t)
 
-	if err := l.Compact(10, 7); err != nil {
+	if err := l.InstallSnapshot(&Snapshot{LastIncludedIndex: 10, LastIncludedTerm: 7}); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 	if l.LastIndex() != 10 || l.LastTerm() != 7 {
@@ -174,14 +174,14 @@ func TestLog_Compact_BeyondEndDiscardsEverything(t *testing.T) {
 	}
 }
 
-// This test checks that compacting at or below the current boundary is a
-// no-op — a stale snapshot must never move the boundary backwards.
+// This test checks that installing a snapshot at or below the current
+// boundary is a no-op — a stale snapshot must never move the boundary backwards.
 func TestLog_Compact_AtOrBelowBoundaryIsNoOp(t *testing.T) {
 	l, _ := fiveEntryLog(t)
-	if err := l.Compact(3, 2); err != nil {
+	if err := l.InstallSnapshot(&Snapshot{LastIncludedIndex: 3, LastIncludedTerm: 2}); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
-	if err := l.Compact(2, 1); err != nil {
+	if err := l.InstallSnapshot(&Snapshot{LastIncludedIndex: 2, LastIncludedTerm: 1}); err != nil {
 		t.Fatalf("stale Compact: %v", err)
 	}
 	if l.SnapshotIndex() != 3 || l.LastIndex() != 5 {
@@ -194,7 +194,7 @@ func TestLog_Compact_AtOrBelowBoundaryIsNoOp(t *testing.T) {
 // removing it would mean a safety property had already failed.
 func TestLog_TruncateFrom_RefusesToCutIntoSnapshot(t *testing.T) {
 	l, _ := fiveEntryLog(t)
-	if err := l.Compact(3, 2); err != nil {
+	if err := l.InstallSnapshot(&Snapshot{LastIncludedIndex: 3, LastIncludedTerm: 2}); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 
@@ -217,9 +217,14 @@ func TestLog_TruncateFrom_RefusesToCutIntoSnapshot(t *testing.T) {
 // memory agree and appends stay contiguous.
 func TestOpenLog_CrashAfterSnapshotBeforeCompact_DropsCoveredEntries(t *testing.T) {
 	l, path := fiveEntryLog(t)
-	l.Close() // "crash": the log still holds 1..5
+	l.Close()
+	// "Crash" between the two steps of InstallSnapshot: the snapshot file is
+	// durably saved, but the log was never compacted and still holds 1..5.
+	if err := SaveSnapshot(path+".snapshot", &Snapshot{LastIncludedIndex: 3, LastIncludedTerm: 2}); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
 
-	recovered, err := OpenLog(path, 3, 2)
+	recovered, err := OpenLog(path, path+".snapshot")
 	if err != nil {
 		t.Fatalf("OpenLog with a snapshot ahead of an uncompacted log: %v", err)
 	}
@@ -235,11 +240,12 @@ func TestOpenLog_CrashAfterSnapshotBeforeCompact_DropsCoveredEntries(t *testing.
 	recovered.Close()
 
 	// The file must have been REWRITTEN, not just filtered in memory: opened
-	// with no snapshot, it should now start at index 4 — which is a gap.
-	if _, err := OpenLog(path, 0, 0); err == nil {
+	// with NO snapshot (a path that doesn't exist), it should now start at
+	// index 4 — which is a gap.
+	if _, err := OpenLog(path, path+".no-such-snapshot"); err == nil {
 		t.Fatalf("file still starts at index 1 — the interrupted compaction was never finished on disk")
 	}
-	final, err := OpenLog(path, 3, 2)
+	final, err := OpenLog(path, path+".snapshot")
 	if err != nil {
 		t.Fatalf("reopen with snapshot: %v", err)
 	}
@@ -258,7 +264,10 @@ func TestOpenLog_CrashWindowWithDivergedLog_DropsEverything(t *testing.T) {
 	l, path := fiveEntryLog(t)
 	l.Close()
 
-	recovered, err := OpenLog(path, 3, 7) // our entry 3 has term 2
+	if err := SaveSnapshot(path+".snapshot", &Snapshot{LastIncludedIndex: 3, LastIncludedTerm: 7}); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err) // our entry 3 has term 2
+	}
+	recovered, err := OpenLog(path, path+".snapshot")
 	if err != nil {
 		t.Fatalf("OpenLog: %v", err)
 	}
@@ -273,12 +282,15 @@ func TestOpenLog_CrashWindowWithDivergedLog_DropsEverything(t *testing.T) {
 // running with a hole in the replicated history.
 func TestOpenLog_GapBetweenSnapshotAndLog_IsError(t *testing.T) {
 	l, path := fiveEntryLog(t)
-	if err := l.Compact(4, 2); err != nil { // file now holds only entry 5
+	if err := l.InstallSnapshot(&Snapshot{LastIncludedIndex: 4, LastIncludedTerm: 2}); err != nil { // file now holds only entry 5
 		t.Fatalf("Compact: %v", err)
 	}
 	l.Close()
 
-	if _, err := OpenLog(path, 2, 1); err == nil {
+	if err := SaveSnapshot(path+".snapshot", &Snapshot{LastIncludedIndex: 2, LastIncludedTerm: 1}); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	if _, err := OpenLog(path, path+".snapshot"); err == nil {
 		t.Fatalf("OpenLog accepted a log starting at 5 after a snapshot ending at 2 — entries 3 and 4 are missing")
 	}
 }
@@ -343,7 +355,7 @@ func TestAppendEntries_PrevLogIndexInsideFollowerSnapshotIsAccepted(t *testing.T
 	for i := uint64(1); i <= 7; i++ {
 		seedLog(t, n, &raftpb.LogEntry{Term: 1, Index: i, Command: []byte{byte('a' + i - 1)}})
 	}
-	if err := n.log.Compact(5, 1); err != nil {
+	if err := n.log.InstallSnapshot(&Snapshot{LastIncludedIndex: 5, LastIncludedTerm: 1}); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 
@@ -383,7 +395,7 @@ func TestAppendEntries_EntirelyCoveredBySnapshotIsAccepted(t *testing.T) {
 	for i := uint64(1); i <= 5; i++ {
 		seedLog(t, n, &raftpb.LogEntry{Term: 1, Index: i, Command: []byte("x")})
 	}
-	if err := n.log.Compact(5, 1); err != nil {
+	if err := n.log.InstallSnapshot(&Snapshot{LastIncludedIndex: 5, LastIncludedTerm: 1}); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 
@@ -397,5 +409,40 @@ func TestAppendEntries_EntirelyCoveredBySnapshotIsAccepted(t *testing.T) {
 	}
 	if n.log.LastIndex() != 5 {
 		t.Fatalf("LastIndex() = %d, want 5 unchanged", n.log.LastIndex())
+	}
+}
+
+// This test checks InstallSnapshot's ordering invariant: the snapshot is
+// saved BEFORE any entry is discarded. A real crash between the two steps
+// can't be simulated here, but a failed save can — by putting the snapshot
+// in a read-only directory while the log's directory stays writable. In the
+// correct order the save fails first and the log is untouched. In the
+// swapped order the entries would already be gone, with no snapshot holding
+// them: lost from this node entirely.
+func TestLogInstallSnapshot_FailedSaveLeavesLogIntact(t *testing.T) {
+	logDir, snapshotDir := t.TempDir(), t.TempDir()
+	l, err := OpenLog(filepath.Join(logDir, "raft-log.dat"), filepath.Join(snapshotDir, "snapshot.dat"))
+	if err != nil {
+		t.Fatalf("OpenLog: %v", err)
+	}
+	defer l.Close()
+	if err := l.Append(entry(1, 1, "a"), entry(1, 2, "b"), entry(1, 3, "c")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	if err := os.Chmod(snapshotDir, 0500); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	defer os.Chmod(snapshotDir, 0700)
+
+	if err := l.InstallSnapshot(&Snapshot{LastIncludedIndex: 2, LastIncludedTerm: 1, Data: []byte("s")}); err == nil {
+		t.Fatalf("InstallSnapshot into a read-only directory succeeded")
+	}
+
+	if l.SnapshotIndex() != 0 {
+		t.Fatalf("SnapshotIndex() = %d after a failed save, want 0", l.SnapshotIndex())
+	}
+	if got, ok := l.EntriesFrom(1); !ok || len(got) != 3 {
+		t.Fatalf("entries after a failed snapshot save = (%d, ok=%v), want all 3 — entries were discarded with no snapshot holding them", len(got), ok)
 	}
 }

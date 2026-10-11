@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"google.golang.org/protobuf/proto"
@@ -62,6 +63,12 @@ type StateMachine struct {
 	store *store.Store
 	dedup *dedup.Table
 
+	// snapshotter is the Raft node, through the narrow interface the state
+	// machine needs. nil means "never snapshot" (most tests). Read only by
+	// the Run goroutine; set once at construction.
+	snapshotter       Snapshotter
+	snapshotThreshold int64 // take a snapshot once the Raft log exceeds this many bytes
+
 	// mu protects lastApplied and appliedCh. Both are written only by the
 	// Run goroutine; read by gRPC handler goroutines waiting in
 	// WaitForApplied for their entry to be applied.
@@ -80,15 +87,28 @@ type StateMachine struct {
 	stopped chan struct{}
 }
 
+// Snapshotter is what the state machine needs from Raft to take snapshots.
+// raft.Node implements it; the interface keeps this package testable
+// without a running node.
+type Snapshotter interface {
+	LogSize() int64
+	Snapshot(index uint64, data []byte) error
+}
+
 // NewStateMachine wraps an EMPTY store and dedup table. Its state is built
-// entirely by applying the committed log from index 1 — there is no other
-// recovery path, which is what makes the KV WAL redundant.
-func NewStateMachine(s *store.Store, d *dedup.Table) *StateMachine {
+// by applying what Raft delivers: a snapshot first if one exists, then the
+// committed log after it.
+//
+// When the Raft log grows past thresholdBytes, the state machine snapshots
+// itself (Milestone 8, Choice 1A). Pass a nil snapshotter to disable that.
+func NewStateMachine(s *store.Store, d *dedup.Table, snapshotter Snapshotter, thresholdBytes int64) *StateMachine {
 	return &StateMachine{
-		store:     s,
-		dedup:     d,
-		appliedCh: make(chan struct{}),
-		stopped:   make(chan struct{}),
+		store:             s,
+		dedup:             d,
+		snapshotter:       snapshotter,
+		snapshotThreshold: thresholdBytes,
+		appliedCh:         make(chan struct{}),
+		stopped:           make(chan struct{}),
 	}
 }
 
@@ -150,13 +170,68 @@ func (sm *StateMachine) Run(applyCh <-chan raft.ApplyMsg) error {
 		if err := sm.apply(msg); err != nil {
 			return err
 		}
+		sm.maybeSnapshot()
 	}
 	return nil
+}
+
+// maybeSnapshot takes a snapshot if the Raft log has grown past the
+// threshold.
+//
+// INVARIANT: runs only on the Run goroutine, between two applies. That is
+// what makes the snapshot exactly "the state after lastApplied": the Run
+// goroutine is the only writer, so nothing can change the store or the dedup
+// table between reading lastApplied and encoding them.
+func (sm *StateMachine) maybeSnapshot() {
+	if sm.snapshotter == nil || sm.snapshotter.LogSize() <= sm.snapshotThreshold {
+		return
+	}
+
+	index := sm.LastApplied()
+	data, err := sm.encodeSnapshot()
+	if err != nil {
+		slog.Error("server: failed to encode snapshot", "index", index, "error", err)
+		return
+	}
+
+	// A failure here costs disk space, not correctness: the log still holds
+	// every entry the snapshot would have replaced. So it is logged and
+	// retried after the next apply rather than treated as fatal.
+	if err := sm.snapshotter.Snapshot(index, data); err != nil {
+		slog.Error("server: failed to take snapshot", "index", index, "error", err)
+	}
+}
+
+// encodeSnapshot serializes the KV map AND the dedup table.
+//
+// Deterministic marshalling: protobuf writes maps in random order by
+// default, so the same state would produce different bytes on every call.
+// Nothing compares snapshot bytes today, but making equal state encode to
+// equal bytes costs nothing and makes snapshots testable byte for byte.
+func (sm *StateMachine) encodeSnapshot() ([]byte, error) {
+	lastSeen := sm.dedup.Snapshot()
+	lastRequestByClient := make(map[string]uint64, len(lastSeen))
+	for clientID, requestID := range lastSeen {
+		lastRequestByClient[string(clientID)] = uint64(requestID)
+	}
+
+	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(&kvpb.KVSnapshot{
+		Data:                sm.store.Snapshot(),
+		LastRequestByClient: lastRequestByClient,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("server: failed to marshal snapshot: %w", err)
+	}
+	return data, nil
 }
 
 // apply executes one committed entry. Deterministic: the same sequence of
 // messages produces the same store and dedup table on every replica.
 func (sm *StateMachine) apply(msg raft.ApplyMsg) error {
+	if msg.Snapshot != nil {
+		return sm.restoreSnapshot(msg)
+	}
+
 	sm.mu.Lock()
 	expected := sm.lastApplied + 1
 	sm.mu.Unlock()
@@ -203,6 +278,33 @@ func (sm *StateMachine) apply(msg raft.ApplyMsg) error {
 		return fmt.Errorf("server: dedup failed applying log index %d: %w", msg.Index, err)
 	}
 
+	sm.markApplied(msg.Index)
+	return nil
+}
+
+// restoreSnapshot replaces the entire state with a delivered snapshot.
+//
+// INVARIANT: a snapshot only ever moves state FORWARD. One at or below
+// lastApplied would roll the store back to an older state, undoing writes
+// clients were told succeeded — so it is an error, not a no-op.
+func (sm *StateMachine) restoreSnapshot(msg raft.ApplyMsg) error {
+	if current := sm.LastApplied(); msg.Index <= current {
+		return fmt.Errorf("server: refusing snapshot at index %d — already applied through %d", msg.Index, current)
+	}
+
+	var snapshot kvpb.KVSnapshot
+	if err := proto.Unmarshal(msg.Snapshot.Data, &snapshot); err != nil {
+		// Same fail-stop reasoning as an undecodable command.
+		return fmt.Errorf("server: cannot decode snapshot at index %d: %w", msg.Index, err)
+	}
+
+	lastSeen := make(map[dedup.ClientID]dedup.RequestID, len(snapshot.LastRequestByClient))
+	for clientID, requestID := range snapshot.LastRequestByClient {
+		lastSeen[dedup.ClientID(clientID)] = dedup.RequestID(requestID)
+	}
+
+	sm.store.Restore(snapshot.Data)
+	sm.dedup.Restore(lastSeen)
 	sm.markApplied(msg.Index)
 	return nil
 }

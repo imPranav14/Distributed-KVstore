@@ -13,7 +13,7 @@ import (
 )
 
 func newTestStateMachine() *StateMachine {
-	return NewStateMachine(store.NewStore(), dedup.NewTable())
+	return NewStateMachine(store.NewStore(), dedup.NewTable(), nil, 0)
 }
 
 // cmdMsg builds an ApplyMsg carrying an encoded KV command.

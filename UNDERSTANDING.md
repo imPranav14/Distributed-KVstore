@@ -1849,4 +1849,165 @@ Deferred to the end of Milestone 8c.
 
 ---
 
+## Milestone 8b — Taking Snapshots and Restarting From Them
+Date: 2026-10-11
+
+### The Problem This Solves
+8a built a log that can be compacted, but nothing compacted it. 8b makes
+nodes take snapshots when their log grows past a threshold, and restart
+from a snapshot plus the log after it instead of the whole history. This
+is where "bounded disk usage" and "bounded restart time" actually happen.
+
+### The Design Decision Made
+**A revision to 8a: the log owns its snapshot.** 8a left "snapshot durable
+before compacting" as a precondition every caller had to remember. 8b and
+8c add two callers (local snapshots, installing a leader's snapshot), so
+that would have been two places to get the order wrong. Now
+`OpenLog(logPath, snapshotPath)` loads the snapshot itself, and
+`Log.InstallSnapshot` (save, then compact) is the only way to compact;
+`Compact` became unexported. The wrong order is no longer writable. Cost:
+churn on 8a's call sites and tests one commit after shipping them. The
+8a crash-window tests got more realistic as a result: they now save a real
+snapshot file instead of passing numbers.
+
+**The state machine takes the snapshot, on its own Run goroutine (1A).**
+It checks `LogSize()` after each apply; over the threshold, it encodes its
+KV map and dedup table and calls `Node.Snapshot(lastApplied, data)`. Being
+the only writer, the Run goroutine gets a consistent cut for free.
+
+**The dedup table is inside the snapshot** (`KVSnapshot` proto). This is
+Milestone 7's Q4, turned into code and a test.
+
+**Snapshots reach the state machine through the applier (4A)**, as an
+`ApplyMsg` with a non-nil `Snapshot`. One sender, so a snapshot can never be
+overtaken by an older entry.
+
+**Deterministic protobuf marshalling** for snapshot data. Maps encode in
+random order by default; equal state now gives equal bytes.
+
+**Threshold is configurable** (`SNAPSHOT_THRESHOLD_BYTES`, default 1 MiB),
+so 8c's "never compact" break can set it high.
+
+**A failed snapshot is logged, not fatal.** It costs disk space, not
+correctness: the log still holds everything.
+
+### How It Works — Plain English
+After applying each entry, the state machine asks Raft how big its log
+file is. Past the threshold, it serializes everything it holds — every key
+and value, plus the latest request ID seen from every client — and hands
+that to Raft along with the index it has applied through. Raft looks up
+that entry's term, saves the snapshot file durably, and only then rewrites
+the log without the entries the snapshot now covers.
+
+On restart, opening the log loads the snapshot file too. The applier sees
+that the state machine (empty, `lastApplied` 0) is behind the snapshot,
+sends the snapshot first, then sends the entries after it as they commit.
+Restart work is now the snapshot plus a short suffix, not every write ever
+made.
+
+### Key Invariants
+- INVARIANT (`log.go`): `InstallSnapshot` saves the snapshot durably before
+  discarding a single entry, and is the only path that compacts.
+- INVARIANT (`state_machine.go`): snapshots are taken only on the Run
+  goroutine, between applies, so they capture exactly the state after
+  `lastApplied`.
+- INVARIANT (`kv.proto`): the snapshot carries the dedup table.
+- INVARIANT (`apply.go`): a snapshot travels through the same goroutine and
+  channel as entries, so it can never be overtaken by an older entry.
+- INVARIANT (`state_machine.go`): a snapshot only moves state forward; one
+  at or below `lastApplied` is an error.
+- INVARIANT (`apply.go`, `Node.Snapshot`): only state at or below
+  `commitIndex` may be snapshotted.
+
+### The Lines That Matter Most
+
+Line: `if err := SaveSnapshot(l.snapshotPath, snapshot); err != nil { return err }` before `compactLocked(...)` in `InstallSnapshot`
+Does: makes the snapshot durable before anything it covers is deleted.
+Breaks without it (order swapped): mutant verified with a new test that forces the save to fail (snapshot directory read-only, log directory writable). Correct order: save fails, log untouched. Swapped: `SnapshotIndex() = 2 after a failed save` — entries discarded with no snapshot holding them. A real crash can't be simulated in a test; a failed save is the closest honest proxy.
+Why this way: same rule as every milestone since 4 — durable first, then discard.
+
+Line: `LastRequestByClient: lastRequestByClient` in `encodeSnapshot`
+Does: carries the dedup table inside the snapshot.
+Breaks without it: mutant verified — `x = "b" on the original replica, "a" on the restored one`. Exactly the divergence predicted in Milestone 7's Q4.
+Why this way: dedup state is replicated state; anything replicated must survive compaction.
+
+Line: `if snapshot := n.log.Snapshot(); n.lastApplied < snapshot.LastIncludedIndex {` in `runApplier`
+Does: delivers the snapshot before any entry after a restart.
+Breaks without it: mutant verified — the applier never delivered anything, and the end-to-end restart test timed out reading `key-00` (`DeadlineExceeded`).
+Why this way: the snapshot is the base everything after it applies on top of.
+
+Line: `if n.commitIndex > n.lastApplied || n.lastApplied < n.log.SnapshotIndex() { n.signalApplierLocked() }` at the end of each `runApplier` pass
+Does: re-arms the applier whenever work remains after a pass.
+Breaks without it: mutant verified with a test written during the Step 5 audit — the existing restart test PASSED without the re-arm, because it always issued a fresh commit after the snapshot. The failing case: on restart, a leader's commit lands before the applier's first pass; that leaves one wakeup token, the first pass spends it on the snapshot alone, and with no further commit the entries after the snapshot are never applied (`timed out waiting for an ApplyMsg`). In a quiet cluster, indefinitely — and a ReadIndex read waiting on them times out.
+Why this way: the snapshot must go out alone (in that pass `lastApplied` is still below it, so `EntriesFrom` would report compacted), so a second pass is needed; re-checking remaining work after every pass is more robust than reasoning about which signals are still pending.
+
+Line: `if index > n.commitIndex { return error }` in `Node.Snapshot`
+Does: refuses to snapshot an uncommitted entry.
+Breaks without it: the entry becomes permanent on this node (TruncateFrom refuses to cut into a snapshot), so a new leader's legitimate replacement could never repair it.
+Why this way: defensive — the state machine only passes lastApplied, which is always committed, so this cannot trip today and is NOT mutation-tested (a mutant would survive every current test for that reason). It guards future callers.
+
+Line: `if current := sm.LastApplied(); msg.Index <= current { return error }` in `restoreSnapshot`
+Does: refuses a snapshot that would roll state backward.
+Breaks without it: mutant verified — a stale snapshot was applied over newer state.
+Why this way: rolling back would undo writes clients were told succeeded.
+
+### What Breaks and Why
+CLAUDE.md's two named Milestone 8 breaks run in 8c. Here, each 8b guard was
+mutation-tested on a scratch copy, every mutant vetted for compilation:
+
+- **M1 dedup missing from snapshot:** caught (divergence, above). The first
+  attempt did not compile — an over-clever mutation. The compile check has
+  now caught four meaningless results across Milestones 7 and 8.
+- **M2 applier never delivers the snapshot:** caught by both the restart
+  unit test and the end-to-end test.
+- **M3 `commitIndex` starts at 0, not the snapshot:** caught only by its
+  direct unit test; the restart-delivery test PASSED against it. That
+  exposed an error in my own design rationale: I had claimed, in the
+  pseudocode and a code comment, that starting at 0 "would leave the
+  snapshot undelivered." False — the applier's snapshot branch checks only
+  `lastApplied`, never `commitIndex`. The line keeps `commitIndex >=
+  lastApplied` true; nothing currently breaks without it (ReadIndex just
+  reports "not ready" until the next commit). The comment was corrected to
+  say exactly that.
+- **M4 compact before save:** caught by the new failed-save test.
+- **M5 snapshot may move state backward:** caught.
+
+Two test bugs fixed along the way, neither in production code:
+- `startApplierOnly` (a test helper mirroring `Start()` minus the election
+  timer) didn't include `Start()`'s new initial wakeup, so a restart test
+  waited on an applier nothing woke.
+- The threshold test changed the fake log size from the test goroutine
+  while the state machine was still checking after the previous apply — a
+  race. Replaced with a fake that models the log: size grows with each
+  applied entry and drops back after a snapshot, so the trigger point is
+  deterministic.
+
+### End-to-End Result
+A single-node Raft cluster with a 4 KiB threshold took 2,000 writes over 20
+keys. **The log peaked at 4,134 bytes**; without snapshots those writes
+would be roughly 140 KB. Restarting the node from its data directory
+returned the latest value for every key, rebuilt from snapshot plus log
+suffix. (Verified in-process; the real-container run is still deferred.)
+
+### Interview Questions and Answers
+Deferred to the end of Milestone 8c.
+
+### Git Commit Message
+`feat: take snapshots by log size and restart from snapshot plus log suffix`
+
+### Open Questions
+- **Snapshots are written while holding `n.mu`.** During the write the node
+  answers no RPCs and a leader sends no heartbeats; a snapshot slower than
+  an election timeout would trigger an election. Fine at this scale;
+  production systems write snapshots in the background.
+- **Snapshots encode the entire state every time.** Cost is proportional to
+  total data, not to what changed.
+- **A follower behind the leader's snapshot still can't be caught up** —
+  `InstallSnapshot` is 8c.
+- **The spurious "leadership lost" error from 8a's open questions is now
+  reachable**, since snapshots really happen.
+- **Snapshot transfer will be one gRPC message**, capped at 4 MB by default.
+
+---
+
 <!-- All future entries go below this line, in chronological order -->

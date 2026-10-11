@@ -38,7 +38,17 @@ type Config struct {
 	// and any other persistent state are stored. Each node must have its
 	// own directory — sharing one between nodes would corrupt both.
 	DataDir string
+
+	// SnapshotThresholdBytes is the Raft log size at which the state machine
+	// takes a snapshot and compacts the log. Optional
+	// (SNAPSHOT_THRESHOLD_BYTES); defaults to DefaultSnapshotThresholdBytes.
+	SnapshotThresholdBytes int64
 }
+
+// DefaultSnapshotThresholdBytes is 1 MiB: small enough that compaction
+// actually happens in a local cluster, large enough that a node isn't
+// snapshotting after every handful of writes.
+const DefaultSnapshotThresholdBytes = 1 << 20
 
 // Load reads NODE_ID, PEER_ADDRS, GRPC_PORT, and DATA_DIR from the process
 // environment and returns a validated Config. It returns an error naming the
@@ -87,10 +97,21 @@ func Load() (*Config, error) {
 		}
 	}
 
+	snapshotThreshold := int64(DefaultSnapshotThresholdBytes)
+	if raw := os.Getenv("SNAPSHOT_THRESHOLD_BYTES"); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed <= 0 {
+			return nil, fmt.Errorf("config: SNAPSHOT_THRESHOLD_BYTES=%q is not a positive integer", raw)
+		}
+		snapshotThreshold = parsed
+	}
+
 	return &Config{
 		NodeID:    nodeID,
 		PeerAddrs: peerAddrs,
 		GRPCPort:  grpcPort,
 		DataDir:   dataDir,
+
+		SnapshotThresholdBytes: snapshotThreshold,
 	}, nil
 }

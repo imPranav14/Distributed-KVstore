@@ -110,15 +110,21 @@ type Node struct {
 	stopCh chan struct{} // closed by Stop(); read by run()'s select loop
 }
 
-// ApplyMsg is one committed log entry, delivered to the state machine.
+// ApplyMsg is one thing delivered to the state machine: either a committed
+// log entry, or a snapshot that replaces its entire state.
 //
-// An EMPTY Command is a Raft no-op, appended by every new leader. No-ops
-// are delivered rather than filtered out, so the consumer can advance its
-// own applied index past them — see runApplier for why that matters.
+// An EMPTY Command (with Snapshot nil) is a Raft no-op, appended by every
+// new leader. No-ops are delivered rather than filtered out, so the
+// consumer can advance its own applied index past them.
+//
+// A non-nil Snapshot means "discard your state and load this instead";
+// Index and Term are then the snapshot's last included entry, and Command
+// is unused.
 type ApplyMsg struct {
-	Index   uint64
-	Term    uint64
-	Command []byte
+	Index    uint64
+	Term     uint64
+	Command  []byte
+	Snapshot *Snapshot
 }
 
 // NewNode constructs a Node in the Follower role, matching Raft's own
@@ -140,6 +146,21 @@ func NewNode(id uint64, state *State, log *Log, peers map[uint64]Peer, applyCh c
 		applyCh:     applyCh,
 		applyNotify: make(chan struct{}, 1),
 		stopCh:      make(chan struct{}),
+
+		// A snapshot only ever holds applied — hence committed — entries, so
+		// a restarted node knows its commit index is AT LEAST the snapshot's.
+		//
+		// This keeps the invariant commitIndex >= lastApplied true from the
+		// first moment: the applier delivers the snapshot and moves
+		// lastApplied to its index, and commitIndex should never trail what
+		// has already been applied. It is NOT what gets the snapshot
+		// delivered — the applier's snapshot branch checks only lastApplied
+		// against the snapshot index (mutation testing showed delivery works
+		// with this line removed). Nothing currently breaks if commitIndex
+		// trails; ReadIndex, for one, just reports "not ready" until the next
+		// commit. It is kept because the invariant is cheap and every other
+		// reader of commitIndex is entitled to assume it.
+		commitIndex: log.SnapshotIndex(),
 	}
 	n.resetElectionTimerLocked()
 	return n
@@ -150,6 +171,12 @@ func NewNode(id uint64, state *State, log *Log, peers map[uint64]Peer, applyCh c
 func (n *Node) Start() {
 	go n.run()
 	go n.runApplier()
+
+	// Deliver a snapshot loaded from disk straight away, rather than
+	// waiting for the first commit to wake the applier.
+	n.mu.Lock()
+	n.signalApplierLocked()
+	n.mu.Unlock()
 }
 
 // Stop signals the background loop to exit. NOT idempotent — calling it

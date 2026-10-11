@@ -60,3 +60,31 @@ func (s *Store) Delete(key string) {
 
 	delete(s.data, key)
 }
+
+// Snapshot returns a copy of every key-value pair. A copy, not the map
+// itself: the caller encodes it after this lock is released, and handing
+// out the live map would let later writes race with that encoding.
+func (s *Store) Snapshot() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	copied := make(map[string]string, len(s.data))
+	for key, value := range s.data {
+		copied[key] = value
+	}
+	return copied
+}
+
+// Restore replaces the entire contents of the store with data. Used when a
+// replica loads a snapshot: whatever it held before is discarded, not
+// merged — a key absent from the snapshot must be absent afterwards.
+func (s *Store) Restore(data map[string]string) {
+	copied := make(map[string]string, len(data))
+	for key, value := range data {
+		copied[key] = value
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data = copied
+}

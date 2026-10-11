@@ -156,3 +156,42 @@ func TestLoad_NonIntegerNodeID_ReturnsError(t *testing.T) {
 		t.Fatalf("Load with non-integer NODE_ID: err = nil, want an error")
 	}
 }
+
+// This test checks that SNAPSHOT_THRESHOLD_BYTES is optional and defaults
+// to DefaultSnapshotThresholdBytes when unset.
+func TestLoad_SnapshotThreshold_DefaultsWhenUnset(t *testing.T) {
+	setEnv(t, baseEnv())
+	unsetEnv(t, "SNAPSHOT_THRESHOLD_BYTES")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SnapshotThresholdBytes != DefaultSnapshotThresholdBytes {
+		t.Fatalf("SnapshotThresholdBytes = %d, want default %d", cfg.SnapshotThresholdBytes, DefaultSnapshotThresholdBytes)
+	}
+}
+
+// This test checks that a valid override is used, and that zero, negative
+// and non-integer values are rejected rather than silently disabling or
+// mangling compaction.
+func TestLoad_SnapshotThreshold_OverrideAndValidation(t *testing.T) {
+	env := baseEnv()
+	env["SNAPSHOT_THRESHOLD_BYTES"] = "4096"
+	setEnv(t, env)
+	cfg, err := Load()
+	if err != nil || cfg.SnapshotThresholdBytes != 4096 {
+		t.Fatalf("Load with 4096 = (%v, %v), want 4096", cfg, err)
+	}
+
+	for _, bad := range []string{"0", "-5", "lots"} {
+		t.Run(bad, func(t *testing.T) {
+			env := baseEnv()
+			env["SNAPSHOT_THRESHOLD_BYTES"] = bad
+			setEnv(t, env)
+			if _, err := Load(); err == nil {
+				t.Fatalf("SNAPSHOT_THRESHOLD_BYTES=%q accepted, want an error", bad)
+			}
+		})
+	}
+}

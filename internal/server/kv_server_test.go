@@ -63,13 +63,13 @@ func startTestNode(t *testing.T, peers map[uint64]raft.Peer) *testNode {
 	if err != nil {
 		t.Fatalf("LoadState: %v", err)
 	}
-	log, err := raft.OpenLog(filepath.Join(dir, "raft-log.dat"), 0, 0)
+	log, err := raft.OpenLog(filepath.Join(dir, "raft-log.dat"), filepath.Join(dir, "snapshot.dat"))
 	if err != nil {
 		t.Fatalf("OpenLog: %v", err)
 	}
 
 	applyCh := make(chan raft.ApplyMsg)
-	sm := NewStateMachine(store.NewStore(), dedup.NewTable())
+	sm := NewStateMachine(store.NewStore(), dedup.NewTable(), nil, 0)
 	node := raft.NewNode(1, state, log, peers, applyCh)
 
 	runDone := make(chan error, 1)

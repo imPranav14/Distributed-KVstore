@@ -42,7 +42,7 @@ func newTestNodeWithApplyCh(t *testing.T, id uint64) (*Node, <-chan ApplyMsg) {
 	if err != nil {
 		t.Fatalf("LoadState: %v", err)
 	}
-	l, err := OpenLog(filepath.Join(dir, "raft-log.dat"), 0, 0)
+	l, err := OpenLog(filepath.Join(dir, "raft-log.dat"), filepath.Join(dir, "snapshot.dat"))
 	if err != nil {
 		t.Fatalf("OpenLog: %v", err)
 	}

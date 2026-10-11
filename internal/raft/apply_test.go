@@ -36,8 +36,16 @@ func assertNothingApplied(t *testing.T, applyCh <-chan ApplyMsg) {
 // TestSingleNode_ElectsItselfAndCommitsOwnProposals); with the full Start()
 // that self-election would append and commit a no-op mid-test. Stop() still
 // ends it, via the same stopCh.
+//
+// It must mirror everything else Start() does — including the initial
+// wakeup that delivers a snapshot loaded from disk. Without it, a restart
+// test waits on an applier nothing ever wakes, and fails for a reason
+// production code doesn't have.
 func startApplierOnly(n *Node) {
 	go n.runApplier()
+	n.mu.Lock()
+	n.signalApplierLocked()
+	n.mu.Unlock()
 }
 
 // This test checks that the applier delivers committed entries in index
@@ -90,7 +98,7 @@ func TestApplier_DeliversCommittedEntriesInOrderExactlyOnce(t *testing.T) {
 func TestApplier_ExitsOnStopWhileBlockedAndClosesChannel(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := LoadState(dir + "/raft-state.dat")
-	l, _ := OpenLog(dir+"/raft-log.dat", 0, 0)
+	l, _ := OpenLog(dir+"/raft-log.dat", dir+"/snapshot.dat")
 	defer l.Close()
 
 	applyCh := make(chan ApplyMsg) // UNBUFFERED, and nobody reads it yet

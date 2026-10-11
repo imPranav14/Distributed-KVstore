@@ -87,3 +87,29 @@ func (t *Table) Execute(clientID ClientID, requestID RequestID, applyFn func() e
 	t.lastSeen[clientID] = requestID
 	return false, nil
 }
+
+// Snapshot returns a copy of the latest applied RequestID for every client —
+// the dedup state that must travel inside a state machine snapshot.
+func (t *Table) Snapshot() map[ClientID]RequestID {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	copied := make(map[ClientID]RequestID, len(t.lastSeen))
+	for clientID, requestID := range t.lastSeen {
+		copied[clientID] = requestID
+	}
+	return copied
+}
+
+// Restore replaces the table's entire contents with lastSeen, discarding
+// whatever it held before.
+func (t *Table) Restore(lastSeen map[ClientID]RequestID) {
+	copied := make(map[ClientID]RequestID, len(lastSeen))
+	for clientID, requestID := range lastSeen {
+		copied[clientID] = requestID
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.lastSeen = copied
+}

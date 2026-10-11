@@ -47,8 +47,20 @@ type Log struct {
 	path string
 	file *os.File
 
+	// snapshotPath is where this log's snapshot lives, and snapshot is that
+	// file's contents, held in memory: the applier delivers it on restart
+	// and InstallSnapshot (8c) ships it to lagging followers.
+	//
+	// The log owns its snapshot so that "snapshot durable BEFORE entries are
+	// discarded" is enforced in exactly one place — InstallSnapshot — rather
+	// than being a precondition every caller has to remember.
+	snapshotPath string
+	snapshot     *Snapshot
+
 	// snapshotIndex/snapshotTerm identify the last entry folded into the
 	// snapshot. Entries at or below snapshotIndex no longer exist here.
+	// Always equal to snapshot.LastIncludedIndex/Term; kept as separate
+	// fields because every accessor in this file uses them.
 	snapshotIndex uint64
 	snapshotTerm  uint64
 
@@ -65,28 +77,87 @@ type Log struct {
 	size int64 // current logical file size in bytes
 }
 
-// OpenLog opens (creating if necessary) the log file at path and replays
-// its contents into memory, given the snapshot the caller has already
-// loaded. The snapshot file — not the log file — is the authority on where
-// the log begins; the log file carries no header of its own, so every log
-// written before Milestone 8 is still valid as "a log whose snapshot is at 0".
+// OpenLog loads the snapshot at snapshotPath (a missing file is the empty
+// snapshot), then opens (creating if necessary) the log file at logPath and
+// replays it. The snapshot file — not the log file — is the authority on
+// where the log begins; the log file carries no header of its own, so every
+// log written before Milestone 8 is still valid as "a log whose snapshot is
+// at 0". Loading both here means the two can never be opened out of step.
 //
 // Replay doubles as crash recovery for an interrupted compaction: if the
 // node crashed after saving a snapshot but before compacting the log, the
 // file still holds entries the snapshot covers. They are dropped here, and
 // the file is rewritten so file and memory agree again.
-func OpenLog(path string, snapshotIndex, snapshotTerm uint64) (*Log, error) {
-	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+func OpenLog(logPath, snapshotPath string) (*Log, error) {
+	snapshot, err := LoadSnapshot(snapshotPath)
 	if err != nil {
-		return nil, fmt.Errorf("raft: failed to open log %s: %w", path, err)
+		return nil, err
 	}
 
-	l := &Log{path: path, file: file, snapshotIndex: snapshotIndex, snapshotTerm: snapshotTerm}
+	file, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("raft: failed to open log %s: %w", logPath, err)
+	}
+
+	l := &Log{
+		path:          logPath,
+		file:          file,
+		snapshotPath:  snapshotPath,
+		snapshot:      snapshot,
+		snapshotIndex: snapshot.LastIncludedIndex,
+		snapshotTerm:  snapshot.LastIncludedTerm,
+	}
 	if err := l.replayFromDisk(); err != nil {
 		l.file.Close()
 		return nil, err
 	}
 	return l, nil
+}
+
+// Snapshot returns the log's current snapshot. Never nil: a log that has
+// never been compacted returns the empty snapshot at (0, 0).
+func (l *Log) Snapshot() *Snapshot {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.snapshot
+}
+
+// SizeBytes returns the current size of the log file — what the snapshot
+// trigger compares against its threshold.
+func (l *Log) SizeBytes() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.size
+}
+
+// InstallSnapshot makes snapshot this log's new base: it saves the snapshot
+// durably, THEN discards every entry the snapshot covers. It is the only
+// way to compact the log.
+//
+// INVARIANT: the snapshot is fsynced and renamed into place before a single
+// entry is discarded. Discarding first and crashing before the snapshot
+// lands would lose those entries from this node entirely — they would exist
+// in neither file. The other order is harmless: a crash between the two
+// steps leaves both files, and OpenLog drops the covered entries on the next
+// start.
+//
+// A no-op if the snapshot is not ahead of the current one: a stale
+// snapshot must never move the boundary backwards.
+func (l *Log) InstallSnapshot(snapshot *Snapshot) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if snapshot.LastIncludedIndex <= l.snapshotIndex {
+		return nil
+	}
+	if err := SaveSnapshot(l.snapshotPath, snapshot); err != nil {
+		return err
+	}
+	if err := l.compactLocked(snapshot.LastIncludedIndex, snapshot.LastIncludedTerm); err != nil {
+		return err
+	}
+	l.snapshot = snapshot
+	return nil
 }
 
 // replayFromDisk reads every complete entry from the file, keeps the ones
@@ -365,23 +436,17 @@ func (l *Log) TruncateFrom(index uint64) error {
 	return nil
 }
 
-// Compact discards every entry up to and including index, which a snapshot
-// now covers, and moves the snapshot boundary to (index, term).
-//
-// PRECONDITION: a snapshot through index has ALREADY been durably saved.
-// Compact deletes the only other copy of those entries; calling it first
-// and crashing before the snapshot lands would lose them outright. The
-// reverse order is safe: a crash between saving the snapshot and compacting
-// is repaired by OpenLog, which drops the covered entries on the next start.
+// compactLocked discards every entry up to and including index and moves
+// the snapshot boundary to (index, term). Callers must hold mu, and must
+// already have saved a snapshot through index — which is why the only
+// caller is InstallSnapshot.
 //
 // If this log holds the entry at index with the same term, the entries
 // after it are kept. Otherwise — the snapshot is from history this log
-// never agreed with, or extends past its end (InstallSnapshot, 8c) — every
-// entry is discarded. A no-op if index is not beyond the current boundary.
-func (l *Log) Compact(index, term uint64) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
+// never agreed with, or extends past its end (a leader's snapshot sent to a
+// far-behind follower) — every entry is discarded. A no-op if index is not
+// beyond the current boundary.
+func (l *Log) compactLocked(index, term uint64) error {
 	if index <= l.snapshotIndex {
 		return nil
 	}
