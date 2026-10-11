@@ -77,7 +77,7 @@ func startSingleNodeRaft(t *testing.T) *server.KVServer {
 	if err != nil {
 		t.Fatalf("LoadState: %v", err)
 	}
-	log, err := raft.OpenLog(filepath.Join(dir, "raft-log.dat"))
+	log, err := raft.OpenLog(filepath.Join(dir, "raft-log.dat"), 0, 0)
 	if err != nil {
 		t.Fatalf("OpenLog: %v", err)
 	}

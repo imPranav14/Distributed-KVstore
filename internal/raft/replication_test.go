@@ -19,7 +19,7 @@ func seedLog(t *testing.T, n *Node, entries ...*raftpb.LogEntry) {
 // logCommands returns each entry's command as a string, for readable
 // assertions about the log's exact contents.
 func logCommands(n *Node) []string {
-	entries := n.log.EntriesFrom(1)
+	entries, _ := n.log.EntriesFrom(n.log.SnapshotIndex() + 1)
 	out := make([]string, len(entries))
 	for i, e := range entries {
 		out[i] = string(e.Command)
@@ -287,7 +287,7 @@ func TestAppendEntries_EntriesAreDurableBeforeSuccess(t *testing.T) {
 
 	// Reopen the log file independently: if Success was returned before the
 	// fsync, the entry might not be on disk at all.
-	reopened, err := OpenLog(n.log.file.Name())
+	reopened, err := OpenLog(n.log.file.Name(), 0, 0)
 	if err != nil {
 		t.Fatalf("reopen log: %v", err)
 	}

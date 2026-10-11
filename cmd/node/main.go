@@ -58,7 +58,13 @@ func main() {
 	}
 
 	raftLogPath := filepath.Join(cfg.DataDir, "raft-log.dat")
-	raftLog, err := raft.OpenLog(raftLogPath)
+	// TRANSITIONAL (Milestone 8a): no snapshot base yet. Nothing in 8a ever
+	// writes a snapshot, so (0, 0) is exact. Milestone 8b loads the snapshot
+	// file here and passes its index and term — and must, in the SAME change,
+	// restore the state machine from it. Passing a non-zero base without that
+	// restore would start the store empty while the log skips everything the
+	// snapshot covered: silent loss of all of it.
+	raftLog, err := raft.OpenLog(raftLogPath, 0, 0)
 	if err != nil {
 		slog.Error("node: failed to open raft log", "path", raftLogPath, "error", err)
 		os.Exit(1)

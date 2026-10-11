@@ -1,5 +1,7 @@
 package raft
 
+import "log/slog"
+
 // signalApplierLocked wakes runApplier because commitIndex has advanced.
 // Callers must hold mu. It never blocks: applyNotify has capacity 1, and if
 // a wakeup is already pending, this one is redundant — runApplier always
@@ -32,7 +34,16 @@ func (n *Node) runApplier() {
 		n.mu.Lock()
 		var pending []ApplyMsg
 		if n.commitIndex > n.lastApplied {
-			for _, entry := range n.log.EntriesFrom(n.lastApplied + 1) {
+			entries, ok := n.log.EntriesFrom(n.lastApplied + 1)
+			if !ok {
+				// The next entry to apply has been compacted into a
+				// snapshot this state machine hasn't received. Unreachable
+				// in Milestone 8a — nothing compacts yet. 8b makes the
+				// applier deliver the snapshot itself before resuming.
+				slog.Error("raft: next entry to apply is compacted and no snapshot delivery exists yet",
+					"node_id", n.id, "last_applied", n.lastApplied)
+			}
+			for _, entry := range entries {
 				if entry.Index > n.commitIndex {
 					break
 				}

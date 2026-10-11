@@ -1693,4 +1693,160 @@ Overall: 2 strong, 3 need more depth. Every conclusion was correct; precision dr
 
 ---
 
+## Milestone 8a — A Compactable Log and the Snapshot File
+Date: 2026-10-11
+
+### The Problem This Solves
+The Raft log never shrinks and a restart replays it from index 1, so disk
+use and recovery time both grow with the total number of writes ever made.
+Snapshots fix that, but only if the log can lose its prefix and keep
+working: every piece of code that assumed "the log starts at index 1" now
+has to cope with a log that starts somewhere else. 8a builds that log, plus
+the snapshot file it depends on, before anything actually takes a snapshot.
+
+Milestone 8 is split 8a (this entry), 8b (taking snapshots: state machine
+serialization including dedup, size trigger, restart from a snapshot), 8c
+(InstallSnapshot and both CLAUDE.md breaks). Interview drill at the end of 8c.
+
+### The Design Decision Made
+Defaults accepted for the whole milestone: the state machine decides when
+to snapshot (1A), triggered by log size in bytes (2A), log compacted by
+rewrite-and-rename (3A), installed snapshots delivered through the applier
+(4A), one-message transfer (5).
+
+**The snapshot boundary is a movable sentinel.** `TermAt(snapshotIndex)`
+always reports `snapshotTerm`. An uncompacted log is just the special case
+`(0, 0)` — Milestone 6's "index 0 sentinel." Compaction moves it forward;
+the consistency check needed no special case before and needs none now.
+
+**The log file gets no header; the snapshot file is the authority on where
+the log begins.** `OpenLog(path, snapshotIndex, snapshotTerm)`. Rejected:
+recording the base inside the log file. Two reasons: no format migration
+(every existing log is "a log whose snapshot is at 0"), and it turns the
+crash window between saving a snapshot and compacting the log into an
+ordinary code path rather than special recovery logic. The cost: two files
+must agree, and a gap between them is a hard error.
+
+**`EntriesFrom` returns `(entries, ok)`.** "Those entries are compacted"
+(send the snapshot) and "nothing after the end" (send nothing) need
+different responses; a nil return would let a caller confuse them.
+
+**Snapshot file format** mirrors the log's: `[8 index][8 term][4 dataLen][data]`,
+written with `state.go`'s temp-file / fsync / rename / directory-fsync
+pattern. Data is opaque to Raft.
+
+### How It Works — Plain English
+The log now remembers the index and term of the last entry it threw away.
+Asking for an entry at or below that point gets "gone," except for that
+exact boundary entry, whose term is remembered. Asking for the last index
+or last term counts the thrown-away entries, so a log that has compacted
+everything still describes itself honestly.
+
+`Compact(index, term)` is called only after a snapshot through `index` is
+safely on disk. If the log holds the entry at `index` with the same term,
+everything after it is kept; otherwise the log disagreed with the snapshot
+(or the snapshot is ahead of it) and everything goes. The survivors are
+written to a temp file, which then atomically replaces the log.
+
+On startup, the caller loads the snapshot first and hands its index and
+term to `OpenLog`. Replay drops any entry the snapshot covers — or
+everything, if the log's entry at the boundary disagrees — and if it
+dropped anything, rewrites the file so disk and memory agree. That is what
+makes a crash between "snapshot saved" and "log compacted" harmless.
+
+A follower whose snapshot is ahead of the leader's guess no longer rejects
+AppendEntries forever: the request is trimmed to start at the follower's
+snapshot boundary, since everything below it is committed and identical on
+every node.
+
+### Key Invariants
+- INVARIANT (`log.go`): a fully compacted log reports the snapshot's term as
+  its last term, never 0 — otherwise the election restriction switches off.
+- INVARIANT (`log.go`): `TruncateFrom` never cuts at or below the snapshot
+  boundary; those entries were applied, hence committed.
+- INVARIANT (`log.go`): `Compact` requires a durable snapshot first; the
+  boundary moves in memory only after the rewritten file is in place.
+- INVARIANT (`log.go`): replay keeps entries after the boundary only if the
+  log's entry AT the boundary has the snapshot's term.
+- INVARIANT (`log.go`): if replay dropped anything, the file is rewritten,
+  so the next append can't land after stale entries.
+- INVARIANT (`log.go`): the log must begin exactly at `snapshotIndex + 1`;
+  a gap is a hard error.
+- INVARIANT (`replication.go`): an AppendEntries whose `prevLogIndex` lies
+  inside our snapshot is trimmed to the boundary, never rejected.
+- INVARIANT (`snapshot.go`): the snapshot file is replaced whole and
+  atomically; any size mismatch is corruption.
+
+### The Lines That Matter Most
+
+Line: `if len(l.entries) == 0 { return l.snapshotTerm }` in `lastTermLocked`
+Does: makes a fully compacted log report its true last term.
+Breaks without it: mutant verified — `last = (5, 0), want (5, 3)`, and at the RequestVote level a fully compacted node with last term 4 voted for a candidate whose newest entry was from term 1.
+Why this way: `IsUpToDate` compares last terms first; a node that misreports its term as 0 loses to ANY candidate with a non-zero term, regardless of length.
+
+Line: `req = n.trimToSnapshotLocked(req)` in `HandleAppendEntries`
+Does: re-bases a request whose `prevLogIndex` falls inside our snapshot.
+Breaks without it: mutant verified — both trim tests rejected. In 8b, where followers compact on their own, a healthy follower would be rejected forever and never receive another entry. A liveness bug that nothing in the concept brief predicted; it surfaced while designing 8a.
+Why this way: entries at or below our snapshot are committed, and by Leader Completeness every leader holds the same ones.
+
+Line: `if len(survivors) != len(fileEntries) { return l.rewriteLocked(survivors) }` in replay
+Does: finishes an interrupted compaction on disk, not just in memory.
+Breaks without it: mutant verified — the file still started at index 1 after recovery. The next append would land after stale entries and break contiguity on the following restart.
+Why this way: memory may never be ahead of, or different from, the file.
+
+Line: `if entry.Index == l.snapshotIndex && entry.Term != l.snapshotTerm { return nil, nil }` in `entriesAfterSnapshot`
+Does: drops the whole log when it disagrees with the snapshot at the boundary.
+Breaks without it: mutant verified — `last = (5, 3), want (3, 7)`; a suffix from diverged history survived recovery.
+Why this way: the same rule `Compact` applies, so recovering from an interrupted compaction gives exactly the result the compaction would have.
+
+Line: building a new `AppendEntriesRequest` field by field instead of `trimmed := *req`
+Does: avoids copying a protobuf message by value.
+Breaks without it: `go vet` rejected the first version — generated messages embed state containing a `sync.Mutex`. Caught by vet before any test ran.
+Why this way: the cost is that a new proto field must be added here too, or this path silently drops it. Noted in the code.
+
+### What Breaks and Why
+Milestone 8's two CLAUDE.md-named breaks need snapshots to actually be
+taken, so they run in 8c. Here, each 8a guard was mutation-tested on a
+scratch copy, each mutant vetted for compilation first:
+
+- **M1: fully compacted log reports term 0.** Caught by the unit test.
+  But the Node-level RequestVote test PASSED against it, because it used an
+  empty-log candidate: with our term misreported as 0, the empty candidate
+  tied on term and lost on length — refused for the wrong reason. Rewritten
+  to use the candidate that actually exploits the bug (long log, stale term
+  1), it now fails against the mutant. Same lesson as 7b's single-waiter
+  test: a test can pass against a bug when its input happens to take a
+  different safe path.
+- **M2: no trim.** Both trim tests failed.
+- **M3: replay never rewrites.** The crash-window test failed.
+- **M4: replay keeps a diverged suffix.** The diverged crash test failed.
+- **M5: TruncateFrom may cut into the snapshot.** Its test failed.
+
+### Interview Questions and Answers
+Deferred to the end of Milestone 8c.
+
+### Git Commit Message
+`feat: add compactable Raft log with snapshot boundary and snapshot file`
+
+### Open Questions
+- **Nothing takes a snapshot yet.** `main.go` passes `(0, 0)` to `OpenLog`,
+  marked TRANSITIONAL. 8b must load the snapshot AND restore the state
+  machine from it in the same change; a non-zero base without the restore
+  would silently lose everything the snapshot covers.
+- **The applier can't deliver a snapshot yet.** If the next entry to apply
+  were compacted, it logs an error and delivers nothing. Unreachable in 8a;
+  8b replaces it.
+- **A follower behind the leader's snapshot can't be caught up yet.**
+  `replicateToPeer` returns without sending. 8c's InstallSnapshot.
+- **Compaction rewrites the whole surviving log.** Proportional to what
+  remains, paid only at compaction. Segment files (etcd's approach) would
+  avoid it.
+- **7b's term check can now see a compacted index.** If a snapshot
+  compacts past an index between its apply and the handler's `TermAt`, the
+  handler reports "leadership lost" for a write that succeeded. Safe (an
+  error means outcome unknown; the retry is deduplicated) but spurious.
+  Matters once 8b triggers snapshots.
+
+---
+
 <!-- All future entries go below this line, in chronological order -->

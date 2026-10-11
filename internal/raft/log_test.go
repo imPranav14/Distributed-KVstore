@@ -11,7 +11,7 @@ import (
 func newTestLog(t *testing.T) (*Log, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "raft-log.dat")
-	l, err := OpenLog(path)
+	l, err := OpenLog(path, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenLog: %v", err)
 	}
@@ -46,7 +46,7 @@ func TestLog_Empty_ReportsZeroSentinel(t *testing.T) {
 // whole replication protocol rests on.
 func TestLog_AppendThenReopen_RoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "raft-log.dat")
-	l, err := OpenLog(path)
+	l, err := OpenLog(path, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenLog: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestLog_AppendThenReopen_RoundTrip(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	reopened, err := OpenLog(path)
+	reopened, err := OpenLog(path, 0, 0)
 	if err != nil {
 		t.Fatalf("reopen OpenLog: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestLog_AppendThenReopen_RoundTrip(t *testing.T) {
 	if reopened.LastTerm() != 2 {
 		t.Fatalf("reopened LastTerm() = %d, want 2", reopened.LastTerm())
 	}
-	got := reopened.EntriesFrom(1)
+	got, _ := reopened.EntriesFrom(1)
 	if len(got) != 3 {
 		t.Fatalf("EntriesFrom(1) returned %d entries, want 3", len(got))
 	}
@@ -107,15 +107,18 @@ func TestLog_EntriesFrom(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	got := l.EntriesFrom(2)
+	got, ok := l.EntriesFrom(2)
+	if !ok {
+		t.Fatalf("EntriesFrom(2) reported compacted on a log with no snapshot")
+	}
 	if len(got) != 2 {
 		t.Fatalf("EntriesFrom(2) returned %d entries, want 2", len(got))
 	}
 	if string(got[0].Command) != "b" || string(got[1].Command) != "c" {
 		t.Fatalf("EntriesFrom(2) = [%q %q], want [b c]", got[0].Command, got[1].Command)
 	}
-	if l.EntriesFrom(4) != nil {
-		t.Fatalf("EntriesFrom past the end returned entries, want nil")
+	if past, ok := l.EntriesFrom(4); past != nil || !ok {
+		t.Fatalf("EntriesFrom past the end = (%v, %v), want (nil, true) — empty, but NOT compacted", past, ok)
 	}
 }
 
@@ -124,7 +127,7 @@ func TestLog_EntriesFrom(t *testing.T) {
 // conflict must not leave any part of the bad suffix behind.
 func TestLog_TruncateFrom_RemovesSuffixDurably(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "raft-log.dat")
-	l, err := OpenLog(path)
+	l, err := OpenLog(path, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenLog: %v", err)
 	}
@@ -143,7 +146,7 @@ func TestLog_TruncateFrom_RemovesSuffixDurably(t *testing.T) {
 	}
 
 	// The truncation must have hit the FILE, not just the in-memory slice.
-	reopened, err := OpenLog(path)
+	reopened, err := OpenLog(path, 0, 0)
 	if err != nil {
 		t.Fatalf("reopen OpenLog: %v", err)
 	}
@@ -158,7 +161,7 @@ func TestLog_TruncateFrom_RemovesSuffixDurably(t *testing.T) {
 // the next append would write at a stale offset and corrupt the file.
 func TestLog_AppendAfterTruncate_StaysContiguous(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "raft-log.dat")
-	l, err := OpenLog(path)
+	l, err := OpenLog(path, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenLog: %v", err)
 	}
@@ -176,13 +179,13 @@ func TestLog_AppendAfterTruncate_StaysContiguous(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	reopened, err := OpenLog(path)
+	reopened, err := OpenLog(path, 0, 0)
 	if err != nil {
 		t.Fatalf("reopen OpenLog: %v — file was left corrupt after truncate+append", err)
 	}
 	defer reopened.Close()
 
-	got := reopened.EntriesFrom(1)
+	got, _ := reopened.EntriesFrom(1)
 	if len(got) != 3 {
 		t.Fatalf("reopened log has %d entries, want 3", len(got))
 	}
@@ -201,7 +204,7 @@ func TestLog_AppendAfterTruncate_StaysContiguous(t *testing.T) {
 // later read.
 func TestLog_TornTrailingEntry_IsPhysicallyDiscarded(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "raft-log.dat")
-	l, err := OpenLog(path)
+	l, err := OpenLog(path, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenLog: %v", err)
 	}
@@ -222,7 +225,7 @@ func TestLog_TornTrailingEntry_IsPhysicallyDiscarded(t *testing.T) {
 	}
 	raw.Close()
 
-	recovered, err := OpenLog(path)
+	recovered, err := OpenLog(path, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenLog with a torn tail: %v, want a clean recovery", err)
 	}
@@ -240,7 +243,7 @@ func TestLog_TornTrailingEntry_IsPhysicallyDiscarded(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	final, err := OpenLog(path)
+	final, err := OpenLog(path, 0, 0)
 	if err != nil {
 		t.Fatalf("reopen after torn-tail recovery + append: %v — partial bytes were not discarded", err)
 	}
@@ -255,7 +258,7 @@ func TestLog_TornTrailingEntry_IsPhysicallyDiscarded(t *testing.T) {
 // unlike a torn tail, this cannot be explained by an interrupted write.
 func TestLog_NonContiguousIndex_ReturnsError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "raft-log.dat")
-	l, err := OpenLog(path)
+	l, err := OpenLog(path, 0, 0)
 	if err != nil {
 		t.Fatalf("OpenLog: %v", err)
 	}
@@ -265,7 +268,7 @@ func TestLog_NonContiguousIndex_ReturnsError(t *testing.T) {
 	}
 	l.Close()
 
-	if _, err := OpenLog(path); err == nil {
+	if _, err := OpenLog(path, 0, 0); err == nil {
 		t.Fatalf("OpenLog on a non-contiguous log: err = nil, want an error")
 	}
 }

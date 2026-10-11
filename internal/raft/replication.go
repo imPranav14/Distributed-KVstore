@@ -36,14 +36,17 @@ func (n *Node) HandleAppendEntries(req *raftpb.AppendEntriesRequest) *raftpb.App
 	// fix it, and disrupting a healthy cluster in the process.
 	n.resetElectionTimerLocked()
 
+	req = n.trimToSnapshotLocked(req)
+
 	// The consistency check, which gives Raft its Log Matching Property:
 	// refuse unless our log contains an entry at PrevLogIndex whose term is
 	// PrevLogTerm. Because that check must have passed for entry
 	// PrevLogIndex to have been accepted in the first place, agreement at
 	// one position inductively implies agreement at every position before
 	// it — which is what lets a leader verify an entire log by comparing a
-	// single entry. Index 0 always "exists" with term 0 (Log.TermAt's
-	// sentinel), so an empty log needs no special case here.
+	// single entry. The snapshot boundary always "exists" with the
+	// snapshot's term (Log.TermAt's sentinel; index 0 before any
+	// compaction), so an empty log needs no special case here.
 	prevTerm, exists := n.log.TermAt(req.PrevLogIndex)
 	if !exists || prevTerm != req.PrevLogTerm {
 		// The leader will decrement its nextIndex for us and retry with an
@@ -77,6 +80,49 @@ func (n *Node) HandleAppendEntries(req *raftpb.AppendEntriesRequest) *raftpb.App
 	}
 
 	return &raftpb.AppendEntriesResponse{Term: n.state.CurrentTerm(), Success: true}
+}
+
+// trimToSnapshotLocked rewrites a request whose PrevLogIndex falls inside
+// our snapshot so that it starts at the snapshot boundary instead. Callers
+// must hold mu. Returns req unchanged if there is nothing to trim; never
+// mutates the caller's request.
+//
+// Why this is needed: followers compact on their own (Milestone 8b), so a
+// leader's nextIndex guess can point inside a follower's snapshot. The
+// consistency check would see TermAt(PrevLogIndex) as unknown and reject;
+// the leader would back up further and be rejected again, forever. A
+// perfectly healthy follower would never receive another entry.
+//
+// Why it is safe: every entry at or below snapshotIndex was applied, so it
+// was committed, and by Leader Completeness every leader holds exactly those
+// entries. Agreement up to the snapshot is guaranteed, so the entries the
+// leader re-sends for that range can be dropped, and the check can run at
+// the boundary instead.
+func (n *Node) trimToSnapshotLocked(req *raftpb.AppendEntriesRequest) *raftpb.AppendEntriesRequest {
+	snapshotIndex, snapshotTerm := n.log.SnapshotIndex(), n.log.SnapshotTerm()
+	if req.PrevLogIndex >= snapshotIndex {
+		return req
+	}
+
+	coveredBySnapshot := snapshotIndex - req.PrevLogIndex
+	var remaining []*raftpb.LogEntry
+	if uint64(len(req.Entries)) > coveredBySnapshot {
+		remaining = req.Entries[coveredBySnapshot:]
+	}
+
+	// Built field by field rather than `trimmed := *req`: a generated
+	// protobuf message embeds internal state containing a sync.Mutex, so
+	// copying one by value is a bug (go vet flags it). The cost of building
+	// it explicitly: if AppendEntriesRequest ever gains a field, it must be
+	// added here too, or this path will silently drop it.
+	return &raftpb.AppendEntriesRequest{
+		Term:         req.Term,
+		LeaderId:     req.LeaderId,
+		PrevLogIndex: snapshotIndex,
+		PrevLogTerm:  snapshotTerm,
+		Entries:      remaining,
+		LeaderCommit: req.LeaderCommit,
+	}
 }
 
 // appendEntriesLocked writes req's entries into the log, truncating only
@@ -215,9 +261,18 @@ func (n *Node) replicateToPeer(peerID uint64, peer Peer, term uint64) (acknowled
 		return false
 	}
 	nextIndex := n.nextIndex[peerID]
+	entries, ok := n.log.EntriesFrom(nextIndex)
+	if !ok {
+		// This follower needs entries the leader has compacted away. They
+		// cannot be sent as log entries any more; only the snapshot can
+		// catch it up. That is InstallSnapshot, Milestone 8c. Until then
+		// such a follower stays behind — but cannot block commits, which
+		// only need a majority.
+		n.mu.Unlock()
+		return false
+	}
 	prevLogIndex := nextIndex - 1
-	prevLogTerm, _ := n.log.TermAt(prevLogIndex)
-	entries := n.log.EntriesFrom(nextIndex)
+	prevLogTerm, _ := n.log.TermAt(prevLogIndex) // nextIndex > snapshotIndex, so this is always known
 	commitIndex := n.commitIndex
 	n.mu.Unlock()
 

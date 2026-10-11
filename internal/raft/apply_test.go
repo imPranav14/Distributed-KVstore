@@ -90,7 +90,7 @@ func TestApplier_DeliversCommittedEntriesInOrderExactlyOnce(t *testing.T) {
 func TestApplier_ExitsOnStopWhileBlockedAndClosesChannel(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := LoadState(dir + "/raft-state.dat")
-	l, _ := OpenLog(dir + "/raft-log.dat")
+	l, _ := OpenLog(dir+"/raft-log.dat", 0, 0)
 	defer l.Close()
 
 	applyCh := make(chan ApplyMsg) // UNBUFFERED, and nobody reads it yet
