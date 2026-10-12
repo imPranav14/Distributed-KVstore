@@ -34,6 +34,10 @@ func (r *recordingPeer) AppendEntries(ctx context.Context, req *raftpb.AppendEnt
 	return resp, err
 }
 
+func (r *recordingPeer) InstallSnapshot(ctx context.Context, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
+	return r.inner.InstallSnapshot(ctx, req)
+}
+
 // leaderWithCommittedNoOp makes n leader of term with a committed entry from
 // that same term — the state a real leader reaches once its no-op commits.
 func leaderWithCommittedNoOp(t *testing.T, n *Node, term uint64) {

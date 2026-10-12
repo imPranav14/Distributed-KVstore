@@ -12,6 +12,11 @@ import (
 // restart.
 func openNodeAt(t *testing.T, dir string) (*Node, <-chan ApplyMsg) {
 	t.Helper()
+	return openNodeAtWithID(t, dir, 1)
+}
+
+func openNodeAtWithID(t *testing.T, dir string, id uint64) (*Node, <-chan ApplyMsg) {
+	t.Helper()
 	state, err := LoadState(filepath.Join(dir, "raft-state.dat"))
 	if err != nil {
 		t.Fatalf("LoadState: %v", err)
@@ -22,7 +27,7 @@ func openNodeAt(t *testing.T, dir string) (*Node, <-chan ApplyMsg) {
 	}
 	t.Cleanup(func() { _ = log.Close() })
 	applyCh := make(chan ApplyMsg, 1024)
-	return NewNode(1, state, log, map[uint64]Peer{}, applyCh), applyCh
+	return NewNode(id, state, log, map[uint64]Peer{}, applyCh), applyCh
 }
 
 func commitThrough(n *Node, index uint64) {

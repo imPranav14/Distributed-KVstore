@@ -2010,4 +2010,212 @@ Deferred to the end of Milestone 8c.
 
 ---
 
+## Milestone 8c — InstallSnapshot: Catching Up a Follower Behind the Snapshot
+Date: 2026-10-12
+
+### The Problem This Solves
+Once a leader compacts its log, it can no longer send a lagging follower
+the entries it needs: they are gone. Without a way to ship the snapshot
+itself, a follower that was down or partitioned while the leader compacted
+can never catch up. It falls permanently behind, and the cluster runs one
+replica short for good.
+
+### The Design Decision Made
+**One `InstallSnapshot` RPC, no chunking.** The Raft paper streams large
+snapshots in chunks (`offset`, `done`). Here the whole snapshot is one gRPC
+message. Simpler, but capped by gRPC's 4 MB default message size.
+
+**The leader decides when to send one, at the `EntriesFrom` miss.**
+`replicateToPeer` already asked the log for entries from `nextIndex`; 8a
+made that return `ok=false` when they were compacted. That miss is exactly
+the trigger: send the snapshot instead.
+
+**The follower's handler reuses everything 8a and 8b built.** It runs the
+AppendEntries term rules, then `Log.InstallSnapshot` (save, then compact,
+keep a matching suffix), raises `commitIndex`, and wakes the applier. The
+applier delivers the snapshot to the state machine exactly as on restart.
+No second delivery path.
+
+**A failed install is an error, not a reply.** The response carries only a
+term; the paper assumes installs can't fail, so the leader reads any reply
+in its term as "the follower has everything through the snapshot." A
+follower that couldn't write the snapshot to disk must not say that.
+
+### How It Works — Plain English
+The leader notices a follower needs entry 3, but its log now starts after
+the snapshot at 5. So instead of entries it sends the snapshot: the KV data
+and dedup table as of entry 5, plus that entry's index and term.
+
+The follower checks the term like any leader message, and resets its
+election timer. If it has already committed past entry 5 (the snapshot is a
+late duplicate), it ignores it. Otherwise it saves the snapshot to disk,
+throws away log entries the snapshot covers (keeping later ones only if
+its entry 5 matches the leader's), marks everything through 5 as committed,
+and wakes its applier, which replaces the state machine's contents with the
+snapshot.
+
+The leader, on a successful reply, records the follower as having
+everything through 5 and goes back to sending ordinary entries from 6.
+
+### Key Invariants
+- INVARIANT (`snapshot.go`, `HandleInstallSnapshot`): a failure to store the
+  snapshot is returned as an ERROR, never as a normal response — a normal
+  response would credit the follower with entries it does not have.
+- INVARIANT (`snapshot.go`, `HandleInstallSnapshot`): install only a
+  snapshot that goes BEYOND our commitIndex, so commitIndex never moves
+  backward.
+- (`snapshot.go`, `sendSnapshot`): matchIndex only moves forward — a delayed
+  reply never lowers it.
+- Inherited, and what actually keeps delivery ordered (`apply.go`): the
+  snapshot travels through the same single applier as entries, sent only at
+  the start of a pass and only if `lastApplied` is below it.
+
+### The Lines That Matter Most
+
+Line: `if req.LastIncludedIndex <= n.commitIndex { return ..., nil }`
+Does: ignores a snapshot that doesn't go past what this follower has
+already committed.
+Breaks without it: mutant M1 verified, `commitIndex = 3 after a stale
+snapshot, want 5`. A targeted experiment (stale snapshot at 2 arriving while
+the applier was mid-batch through 3) delivered 1, 2, 3 in order, but left
+`commitIndex 2, lastApplied 3`: the node claims less is committed than it
+has already applied.
+Why this way: **correction to my own pseudocode and first comment.** I
+claimed this check was what kept delivery ordered when a snapshot lands
+mid-batch. M1 disproved that: the mid-batch ordering test passed without it.
+Ordering comes from the applier (single sender; snapshot only at the start
+of a pass, only if `lastApplied` is below it). The check's real job is
+commit-index monotonicity, plus not rewriting files for nothing. Comment
+corrected.
+
+Line: `return nil, fmt.Errorf("raft: node %d failed to install snapshot ...")`
+on `Log.InstallSnapshot` failure
+Does: turns a disk failure into an RPC error.
+Breaks without it (a normal reply instead): mutant M2 verified, `leader
+credited a failed install: matchIndex 5, nextIndex 6; want 0, 1`. With
+matchIndex 5 that follower counts toward a majority for entries 1..5 it does
+not hold. That is Milestone 6's "commit on one machine" by a different route.
+Why this way: the response has no success field. Adding one to the proto
+would also work; an error reuses the leader's existing failure path ("no
+credit, retry next tick") with no new code on the leader.
+
+Line: `if snapshot.LastIncludedIndex > n.matchIndex[peerID] { n.matchIndex[peerID] = snapshot.LastIncludedIndex }`
+Does: only ever raises matchIndex.
+Breaks without it: mutant M3 verified. A late duplicate snapshot reply
+after the follower was confirmed through 7 gave `matchIndex 5, nextIndex
+6; want 7, 8`.
+Why this way: replies arrive in any order; same rule as AppendEntries.
+
+Line: `n.commitIndex = req.LastIncludedIndex` then `n.signalApplierLocked()`
+Does: marks the snapshot committed and wakes the applier to deliver it.
+Breaks without either: mutants M5 and M4 verified, both caught by
+`TestInstallSnapshot_FollowerStoresCommitsAndWakesApplier`. The wakeup is
+checked as a pending signal *before* any applier runs, because a running
+applier's own startup signal would deliver the snapshot anyway and hide the
+missing one.
+Why this way: without the wakeup the follower holds the snapshot on disk
+while its KV store stays stale until some unrelated commit arrives.
+
+Line: `n.resetElectionTimerLocked()` in the handler
+Does: counts the snapshot as hearing from the leader.
+Breaks without it: mutant M6. **It first SURVIVED my test.** That test sent
+a higher-term request, and the higher-term branch (`becomeFollowerLocked`)
+resets the timer itself, so the line under test was never needed. Fixed by
+sending a same-term request, the normal case; then caught: `last heard from
+a leader 1h0m0s ago`.
+Why this way: a follower being caught up may get only snapshot RPCs for a
+while. Without the reset it starts an election against a healthy leader.
+
+### What Breaks and Why
+
+**Mutation round (scratch copies, each vetted for compilation):**
+
+| Mutant | Result |
+|---|---|
+| M1 no stale check | caught (commitIndex backward); ordering test survived, which corrected the design claim |
+| M2 normal reply on failed install | caught (leader credits matchIndex 5) |
+| M3 matchIndex set unconditionally | caught (moved 7 → 5) |
+| M4 no applier wakeup | caught |
+| M5 no commitIndex raise | caught |
+| M6 no election timer reset | survived first; test fixed; caught |
+| M7 leader skips peer instead of sending snapshot | caught, including the 3-node end-to-end test |
+| M8 dedup table left out of the snapshot | caught: the caught-up follower re-applied a retried request (`node 2 has x = "a"`) |
+
+**CLAUDE.md break 1 — never compact, 100k writes:** written, not yet run.
+`TestBreak_NeverCompact` runs the same 100k writes over 1,000 keys with
+compaction off and on, and reports log size, snapshot size and restart time
+for each. It is opt-in because it takes minutes:
+`KVSTORE_LONG=1 go test -run TestBreak_NeverCompact -v -timeout 60m ./internal/server/`.
+Deferred at the user's request; the numbers go here once it runs.
+- Prediction: with compaction off the log grows linearly, at about 70 bytes
+  per write, so roughly 7 MB for 100k writes, even though the live state is
+  only 1,000 small keys. Restart replays all 100k entries. With compaction on
+  the log stays near the 1 MiB threshold, plus a snapshot of tens of KB, and
+  restart replays only the suffix.
+
+**CLAUDE.md break 2 — restore from the snapshot without replaying the rest
+of the log.** The mutant dropped every entry after the snapshot when the log
+was reopened.
+- Prediction: writes after the last snapshot are lost: the newest keys,
+  between 0 and about 58 of them (4 KiB threshold, about 70 bytes per
+  entry). Worse, the mutated replay also *rewrites* the file, so the suffix
+  is erased from disk, not just skipped.
+- What happened: `8 of 300 acknowledged writes lost after restart (snapshot
+  at raft index 293): first key-293, last key-300`. Raft index 1 is the
+  leader's no-op, so key-292 sits at 293, and everything after it was gone.
+- The 2,000-write test showed something worse than loss: `key-00 = "1940"
+  after restart, want "1980"`. The store went **back in time** to an older
+  value. The read succeeds, so a client has no way to tell.
+- Collateral: a node that never snapshotted (snapshot index 0) lost its
+  *entire* log on restart, so seven plain log tests failed too.
+- Why it's wrong at a deep level: a snapshot is a summary of a *prefix* of
+  the log, never the whole. The suffix holds acknowledged writes. Recovery is
+  always snapshot **plus** the suffix, never one or the other.
+  `TestSnapshots_EveryAcknowledgedWriteSurvivesRestart` (each write on its
+  own key) now guards this permanently.
+
+**Two test bugs, and a pre-existing flake, found along the way:**
+- The 3-node end-to-end test first failed with `not leader`. While isolated,
+  the follower kept starting elections (term reached 11). On heal its higher
+  term deposed the healthy leader, since there's no PreVote. Real Raft
+  behavior; the test was writing to a deposed leader. It now retries against
+  whichever node is leader, as the real client does (10/10 passes).
+- M6 survived its first test (above).
+- `TestThreeNodeCluster_ElectsExactlyOneLeader` (Milestone 5) failed in two
+  mutant runs for reasons unrelated to snapshots. On a clean checkout of the
+  last commit it failed **10 of 90** runs. It checked for two followers the
+  instant a leader appeared, but a node that timed out in the same election
+  stays a Candidate until the first heartbeat reaches it. That's a legal
+  transient. It now waits for one leader *and* two followers (0 of 90).
+
+### End-to-End Results
+- **Catch-up through a snapshot (in-process, 3 real nodes):** one follower
+  isolated, 200+ writes with a 2 KiB threshold so the leader compacted past
+  everything the follower lacked, then healed. The follower caught up with
+  no entry 2 in its log (so through the snapshot, not entries), held
+  identical data, and skipped a retried request applied before the snapshot.
+- **Break 1:** deferred (see above).
+
+### Interview Questions and Answers
+Pending (Milestone 8 interview drill follows).
+
+### Git Commit Message
+`feat: catch up lagging followers with InstallSnapshot`
+
+### Open Questions
+- **No PreVote.** A healed partitioned node disrupts a healthy leader with
+  its inflated term (seen in the end-to-end test). Raft §9.6's PreVote fixes
+  this.
+- **Snapshots over 4 MB can't be sent.** Chunking (`offset`/`done`) or a
+  bigger gRPC message limit would be needed.
+- **The whole snapshot is held in memory** on both sides during transfer.
+- **The leader sends the snapshot while a previous one may still be in
+  flight.** Each heartbeat tick can start another transfer to the same slow
+  follower. That's harmless for correctness (the stale check makes
+  duplicates no-ops), but wasteful for big snapshots.
+- **The Docker real-cluster run for 7 and 8 is still deferred**, and so is
+  the 100k-write Break 1 measurement.
+
+---
+
 <!-- All future entries go below this line, in chronological order -->

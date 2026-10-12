@@ -263,13 +263,12 @@ func (n *Node) replicateToPeer(peerID uint64, peer Peer, term uint64) (acknowled
 	nextIndex := n.nextIndex[peerID]
 	entries, ok := n.log.EntriesFrom(nextIndex)
 	if !ok {
-		// This follower needs entries the leader has compacted away. They
-		// cannot be sent as log entries any more; only the snapshot can
-		// catch it up. That is InstallSnapshot, Milestone 8c. Until then
-		// such a follower stays behind — but cannot block commits, which
-		// only need a majority.
+		// This follower needs entries we have compacted away. They cannot
+		// be sent as log entries any more; only our snapshot can catch it
+		// up.
+		snapshot := n.log.Snapshot()
 		n.mu.Unlock()
-		return false
+		return n.sendSnapshot(peerID, peer, term, snapshot)
 	}
 	prevLogIndex := nextIndex - 1
 	prevLogTerm, _ := n.log.TermAt(prevLogIndex) // nextIndex > snapshotIndex, so this is always known

@@ -46,3 +46,7 @@ func (c *raftPeerClient) RequestVote(ctx context.Context, req *raftpb.RequestVot
 func (c *raftPeerClient) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error) {
 	return c.stub.AppendEntries(ctx, req)
 }
+
+func (c *raftPeerClient) InstallSnapshot(ctx context.Context, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
+	return c.stub.InstallSnapshot(ctx, req)
+}

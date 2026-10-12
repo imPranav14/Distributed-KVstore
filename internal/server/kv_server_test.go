@@ -31,6 +31,10 @@ func (votingButUnreachablePeer) AppendEntries(ctx context.Context, req *raftpb.A
 	return nil, errors.New("peer is unreachable")
 }
 
+func (votingButUnreachablePeer) InstallSnapshot(ctx context.Context, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
+	return nil, errors.New("peer is unreachable")
+}
+
 // unreachablePeer fails every RPC. A node whose only peer is unreachable can
 // never collect a majority (it needs 2 of 2 votes), so it stays a follower.
 type unreachablePeer struct{}
@@ -40,6 +44,10 @@ func (unreachablePeer) RequestVote(ctx context.Context, req *raftpb.RequestVoteR
 }
 
 func (unreachablePeer) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error) {
+	return nil, errors.New("peer is unreachable")
+}
+
+func (unreachablePeer) InstallSnapshot(ctx context.Context, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
 	return nil, errors.New("peer is unreachable")
 }
 

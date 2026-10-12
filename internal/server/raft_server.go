@@ -32,3 +32,11 @@ func (s *RaftServer) RequestVote(ctx context.Context, req *raftpb.RequestVoteReq
 func (s *RaftServer) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error) {
 	return s.node.HandleAppendEntries(req), nil
 }
+
+// InstallSnapshot hands off directly to Node.HandleInstallSnapshot. Unlike
+// the other two, this one CAN fail: a follower that could not store the
+// snapshot must say so as an error, so the leader does not credit it with
+// entries it does not hold (see the invariant on HandleInstallSnapshot).
+func (s *RaftServer) InstallSnapshot(ctx context.Context, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
+	return s.node.HandleInstallSnapshot(req)
+}

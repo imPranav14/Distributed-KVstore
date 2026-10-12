@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -183,6 +184,7 @@ func TestStateMachine_SnapshotsWhenLogPassesThreshold(t *testing.T) {
 
 // snapshottingNode is a real single-node Raft cluster over dir, whose state
 // machine snapshots through the node itself — main.go's wiring, in-process.
+// A threshold of 0 turns snapshots off.
 type snapshottingNode struct {
 	raft   *raft.Node
 	sm     *StateMachine
@@ -203,7 +205,11 @@ func startSnapshottingNode(t *testing.T, dir string, thresholdBytes int64) *snap
 
 	applyCh := make(chan raft.ApplyMsg)
 	node := raft.NewNode(1, state, log, map[uint64]raft.Peer{}, applyCh)
-	sm := NewStateMachine(store.NewStore(), dedup.NewTable(), node, thresholdBytes)
+	var snapshotter Snapshotter // nil interface, not a nil *raft.Node, when off
+	if thresholdBytes > 0 {
+		snapshotter = node
+	}
+	sm := NewStateMachine(store.NewStore(), dedup.NewTable(), snapshotter, thresholdBytes)
 	runDone := make(chan struct{})
 	go func() {
 		defer close(runDone)
@@ -270,5 +276,199 @@ func TestSnapshots_BoundLogSizeAndSurviveRestart(t *testing.T) {
 		if resp.Value != want {
 			t.Fatalf("%s = %q after restart, want %q", key, resp.Value, want)
 		}
+	}
+}
+
+// This test checks that EVERY acknowledged write survives a restart, not
+// just the latest value of a few hot keys: each of 300 writes goes to its
+// own key, so a write lost anywhere — before the snapshot, or in the log
+// suffix after it — shows up as a missing key. It is CLAUDE.md's Milestone 8
+// break 2 ("restore from a snapshot without replaying the remaining log")
+// turned into a permanent guard; on failure it names exactly what was lost.
+func TestSnapshots_EveryAcknowledgedWriteSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	const threshold = 4 << 10
+	const writes = 300
+	node := startSnapshottingNode(t, dir, threshold)
+	ctx := context.Background()
+	for i := 1; i <= writes; i++ {
+		put := &kvpb.PutRequest{Key: fmt.Sprintf("key-%03d", i), Value: fmt.Sprint(i), ClientId: "c1", RequestId: uint64(i)}
+		if _, err := node.server.Put(ctx, put); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+	node.stop()
+
+	snapshot, err := raft.LoadSnapshot(filepath.Join(dir, "snapshot.dat"))
+	if err != nil {
+		t.Fatalf("LoadSnapshot: %v", err)
+	}
+	if snapshot.LastIncludedIndex == 0 {
+		t.Fatalf("setup: no snapshot was taken, so this restart does not exercise snapshot + log suffix")
+	}
+
+	restarted := startSnapshottingNode(t, dir, threshold)
+	waitCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	// A linearizable read first, so the restarted node has applied
+	// everything it knows about before the store is inspected directly.
+	if _, err := restarted.server.Get(waitCtx, &kvpb.GetRequest{Key: "key-001"}); err != nil {
+		t.Fatalf("Get after restart: %v", err)
+	}
+	var lost []string
+	for i := 1; i <= writes; i++ {
+		key := fmt.Sprintf("key-%03d", i)
+		if v, _ := restarted.sm.Get(key); v != fmt.Sprint(i) {
+			lost = append(lost, key)
+		}
+	}
+	if len(lost) > 0 {
+		t.Fatalf("%d of %d acknowledged writes lost after restart (snapshot at raft index %d): first %s, last %s",
+			len(lost), writes, snapshot.LastIncludedIndex, lost[0], lost[len(lost)-1])
+	}
+}
+
+// --- end to end: a follower that missed compacted entries ---
+
+// putToCurrentLeader retries a Put against every node until one accepts it,
+// as the real client does. Needed after healing a partition: the healed
+// node campaigned while cut off, and its higher term deposes the leader
+// (there is no PreVote), so leadership may move. Retrying with the SAME
+// request ID is safe — that is what the dedup table is for.
+func putToCurrentLeader(t *testing.T, nodes []*testNode, key, value, clientID string, requestID uint64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, tn := range nodes {
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			_, err := tn.server.Put(ctx, &kvpb.PutRequest{Key: key, Value: value, ClientId: clientID, RequestId: requestID})
+			cancel()
+			if err == nil {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("Put(%s=%s) was not accepted by any node within 5s", key, value)
+}
+
+// This test checks the reason InstallSnapshot exists, on a real 3-node
+// cluster: a follower is cut off while the leader writes enough to compact
+// away everything the follower is missing. Once healed, ordinary log
+// entries can no longer catch it up — only the snapshot can. Afterwards it
+// must hold the same state as the others, INCLUDING the dedup table: a
+// retry of a request applied before the snapshot must be skipped on the
+// caught-up follower too, or that one replica silently diverges.
+func TestInstallSnapshot_IsolatedFollowerCatchesUpAfterLeaderCompacts(t *testing.T) {
+	const threshold = 2 << 10 // 2 KiB — compaction after ~30 writes
+	nodes, network := startSnapshottingCluster(t, 3, threshold)
+	leader := waitForLeader(t, nodes)
+
+	put(t, leader, "x", "a", "client-1", 7) // the request a retry will repeat later
+	var follower *testNode
+	for _, tn := range nodes {
+		if tn != leader {
+			follower = tn
+			break
+		}
+	}
+	waitApplied(t, []*testNode{follower}, "x", "a")
+	network.isolate(follower.raft.ID())
+
+	// The leader and the other follower are still a majority.
+	for i := 1; i <= 200; i++ {
+		put(t, leader, fmt.Sprintf("key-%03d", i), fmt.Sprint(i), "client-2", uint64(i))
+	}
+	put(t, leader, "x", "b", "client-2", 201)
+	if _, ok := leader.raft.TermAt(2); ok {
+		t.Fatalf("setup: leader never compacted entry 2 — the follower could catch up without a snapshot")
+	}
+
+	network.heal(follower.raft.ID())
+	waitApplied(t, nodes, "x", "b")
+	waitApplied(t, nodes, "key-200", "200")
+	if _, ok := follower.raft.TermAt(2); ok {
+		t.Fatalf("follower still holds entry 2 — it caught up through log entries, not the snapshot")
+	}
+
+	// client-1's request 7 is retried. Every replica must skip it.
+	putToCurrentLeader(t, nodes, "x", "a", "client-1", 7)
+	putToCurrentLeader(t, nodes, "fence", "done", "client-3", 1) // committed after the retry
+	waitApplied(t, nodes, "fence", "done")
+	for _, tn := range nodes {
+		if v, _ := tn.sm.Get("x"); v != "b" {
+			t.Fatalf("node %d has x = %q after the retry, want \"b\" — the retry was re-applied", tn.raft.ID(), v)
+		}
+	}
+}
+
+// --- CLAUDE.md Milestone 8 break 1: never compact ---
+
+// fileSize returns path's size, or 0 if it does not exist.
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		t.Fatalf("Stat(%s): %v", path, err)
+	}
+	return info.Size()
+}
+
+// This is CLAUDE.md's break, "never trigger compaction: run 100k writes and
+// observe the log size," as a measurement rather than a pass/fail check. It
+// runs the same 100k writes over 1,000 keys with compaction off and on, and
+// reports disk usage and restart time for each. The live state is the same
+// 1,000 keys either way; only the history kept on disk differs.
+//
+// Opt-in, because 100k fsynced writes take minutes:
+//
+//	KVSTORE_LONG=1 go test -run TestBreak_NeverCompact -v -timeout 60m ./internal/server/
+func TestBreak_NeverCompact(t *testing.T) {
+	if os.Getenv("KVSTORE_LONG") == "" {
+		t.Skip("set KVSTORE_LONG=1 to run the 100k-write compaction measurement")
+	}
+	const writes, keys = 100_000, 1_000
+
+	for _, mode := range []struct {
+		name      string
+		threshold int64
+	}{
+		{"compaction off", 0},
+		{"compaction on (1 MiB default)", 1 << 20},
+	} {
+		dir := t.TempDir()
+		node := startSnapshottingNode(t, dir, mode.threshold)
+		ctx := context.Background()
+		started := time.Now()
+		for i := 0; i < writes; i++ {
+			key := fmt.Sprintf("key-%04d", i%keys)
+			if _, err := node.server.Put(ctx, &kvpb.PutRequest{Key: key, Value: fmt.Sprint(i), ClientId: "c1", RequestId: uint64(i + 1)}); err != nil {
+				t.Fatalf("%s: Put %d: %v", mode.name, i, err)
+			}
+		}
+		writeTime := time.Since(started)
+		node.stop()
+
+		logBytes := fileSize(t, filepath.Join(dir, "raft-log.dat"))
+		snapshotBytes := fileSize(t, filepath.Join(dir, "snapshot.dat"))
+
+		// Restart time: until a read of the LAST key returns its last value.
+		restartStarted := time.Now()
+		restarted := startSnapshottingNode(t, dir, mode.threshold)
+		lastKey := fmt.Sprintf("key-%04d", (writes-1)%keys)
+		waitCtx, cancel := context.WithTimeout(ctx, time.Minute)
+		resp, err := restarted.server.Get(waitCtx, &kvpb.GetRequest{Key: lastKey})
+		cancel()
+		if err != nil || resp.Value != fmt.Sprint(writes-1) {
+			t.Fatalf("%s: after restart Get(%s) = %v, %v; want %d", mode.name, lastKey, resp, err, writes-1)
+		}
+		restartTime := time.Since(restartStarted)
+		restarted.stop()
+
+		t.Logf("%-30s log %9d B  snapshot %7d B  total %9d B  | %d writes in %v  | restart %v",
+			mode.name, logBytes, snapshotBytes, logBytes+snapshotBytes, writes, writeTime.Round(time.Second), restartTime.Round(time.Millisecond))
 	}
 }

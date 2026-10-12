@@ -31,6 +31,13 @@ func (tn *testNetwork) isolate(id uint64) {
 	tn.isolated[id] = true
 }
 
+// heal reconnects a node isolated earlier.
+func (tn *testNetwork) heal(id uint64) {
+	tn.mu.Lock()
+	defer tn.mu.Unlock()
+	delete(tn.isolated, id)
+}
+
 func (tn *testNetwork) blocked(from, to uint64) bool {
 	tn.mu.Lock()
 	defer tn.mu.Unlock()
@@ -60,9 +67,24 @@ func (p *networkPeer) AppendEntries(ctx context.Context, req *raftpb.AppendEntri
 	return p.target.HandleAppendEntries(req), nil
 }
 
+func (p *networkPeer) InstallSnapshot(ctx context.Context, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
+	if p.network.blocked(p.from, p.to) {
+		return nil, errPartitioned
+	}
+	return p.target.HandleInstallSnapshot(req)
+}
+
 // startTestCluster starts n fully wired nodes, each with its own state
-// machine and KVServer.
+// machine and KVServer, with snapshots off.
 func startTestCluster(t *testing.T, n int) ([]*testNode, *testNetwork) {
+	t.Helper()
+	return startSnapshottingCluster(t, n, 0)
+}
+
+// startSnapshottingCluster is startTestCluster with each state machine
+// snapshotting through its own node once the log passes thresholdBytes —
+// main.go's wiring. A threshold of 0 turns snapshots off.
+func startSnapshottingCluster(t *testing.T, n int, thresholdBytes int64) ([]*testNode, *testNetwork) {
 	t.Helper()
 	network := &testNetwork{isolated: map[uint64]bool{}}
 	nodes := make([]*testNode, n)
@@ -79,9 +101,13 @@ func startTestCluster(t *testing.T, n int) ([]*testNode, *testNetwork) {
 			t.Fatalf("OpenLog: %v", err)
 		}
 		applyCh := make(chan raft.ApplyMsg)
-		sm := NewStateMachine(store.NewStore(), dedup.NewTable(), nil, 0)
 		peerMaps[i] = map[uint64]raft.Peer{}
 		node := raft.NewNode(uint64(i+1), state, log, peerMaps[i], applyCh)
+		var snapshotter Snapshotter // nil interface, not a nil *raft.Node, when off
+		if thresholdBytes > 0 {
+			snapshotter = node
+		}
+		sm := NewStateMachine(store.NewStore(), dedup.NewTable(), snapshotter, thresholdBytes)
 
 		runDone := make(chan struct{})
 		go func() {

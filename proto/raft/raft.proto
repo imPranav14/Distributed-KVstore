@@ -10,6 +10,7 @@ option go_package = "github.com/imPranav14/Distributed-KVstore/proto/raft;raftpb
 service Raft {
     rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
     rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+    rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
 }
 
 message RequestVoteRequest {
@@ -53,4 +54,24 @@ message AppendEntriesRequest {
 message AppendEntriesResponse {
     uint64 term = 1;
     bool success = 2;
+}
+
+// InstallSnapshotRequest carries a leader's whole snapshot to a follower that
+// needs entries the leader has already compacted away — the only way such a
+// follower can catch up.
+//
+// Sent as ONE message. The Raft paper adds offset/done fields to stream a
+// large snapshot in chunks; they are deliberately omitted here, which means a
+// snapshot larger than gRPC's 4 MB default message limit cannot be sent.
+message InstallSnapshotRequest {
+    uint64 term = 1;
+    uint64 leader_id = 2;
+    uint64 last_included_index = 3;
+    uint64 last_included_term = 4;
+    bytes data = 5; // opaque to Raft: the state machine's encoded state
+}
+
+message InstallSnapshotResponse {
+    // The follower's term, so a stale leader learns it has been superseded.
+    uint64 term = 1;
 }

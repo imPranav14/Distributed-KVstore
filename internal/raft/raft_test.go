@@ -25,6 +25,10 @@ func (p fakePeer) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesRe
 	return p.node.HandleAppendEntries(req), nil
 }
 
+func (p fakePeer) InstallSnapshot(ctx context.Context, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
+	return p.node.HandleInstallSnapshot(req)
+}
+
 func newTestNode(t *testing.T, id uint64) *Node {
 	t.Helper()
 	node, _ := newTestNodeWithApplyCh(t, id)
@@ -282,14 +286,22 @@ func TestThreeNodeCluster_ElectsExactlyOneLeader(t *testing.T) {
 		}
 	}()
 
+	// Wait for the cluster to SETTLE, not just for a leader to appear. A
+	// node that timed out in the same election (a split vote) stays a
+	// Candidate until the new leader's first heartbeat reaches it, so
+	// checking the instant a leader appears sees 1 leader + 1 candidate —
+	// a legal transient, not a bug. (This flaked ~1 run in 9 before.)
 	waitFor(t, 2*time.Second, func() bool {
-		leaders := 0
+		leaders, followers := 0, 0
 		for _, n := range nodes {
-			if n.Role() == Leader {
+			switch n.Role() {
+			case Leader:
 				leaders++
+			case Follower:
+				followers++
 			}
 		}
-		return leaders == 1
+		return leaders == 1 && followers == 2
 	})
 
 	leaders, followers := 0, 0
@@ -377,6 +389,10 @@ func (deadPeer) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesRequ
 	return nil, errors.New("peer is unreachable")
 }
 
+func (deadPeer) InstallSnapshot(ctx context.Context, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
+	return nil, errors.New("peer is unreachable")
+}
+
 // gatedPeer forwards to an inner Peer, but holds every AppendEntries that
 // carries entries until the test releases it. That lets a test change the
 // leader's state while one specific request is provably in flight — the
@@ -398,4 +414,8 @@ func (g *gatedPeer) AppendEntries(ctx context.Context, req *raftpb.AppendEntries
 		<-g.release
 	}
 	return g.inner.AppendEntries(ctx, req)
+}
+
+func (g *gatedPeer) InstallSnapshot(ctx context.Context, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
+	return g.inner.InstallSnapshot(ctx, req)
 }

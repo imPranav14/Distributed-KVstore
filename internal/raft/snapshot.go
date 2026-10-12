@@ -1,10 +1,14 @@
 package raft
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+
+	raftpb "github.com/imPranav14/Distributed-KVstore/proto/raft"
 )
 
 // snapshotHeaderSize is [8-byte lastIncludedIndex][8-byte lastIncludedTerm]
@@ -93,4 +97,116 @@ func SaveSnapshot(path string, snapshot *Snapshot) error {
 		return fmt.Errorf("raft: failed to rename snapshot into place: %w", err)
 	}
 	return syncDir(dir)
+}
+
+// sendSnapshot ships our snapshot to a follower that needs entries we have
+// compacted away. Called by replicateToPeer without mu held; returns, like
+// replicateToPeer, whether the follower acknowledged us as leader of term.
+func (n *Node) sendSnapshot(peerID uint64, peer Peer, term uint64, snapshot *Snapshot) (acknowledgedTerm bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+	defer cancel()
+
+	resp, err := peer.InstallSnapshot(ctx, &raftpb.InstallSnapshotRequest{
+		Term:              term,
+		LeaderId:          n.id,
+		LastIncludedIndex: snapshot.LastIncludedIndex,
+		LastIncludedTerm:  snapshot.LastIncludedTerm,
+		Data:              snapshot.Data,
+	})
+	if err != nil {
+		return false // retried on the next tick, same as a failed AppendEntries
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if resp.Term > n.state.CurrentTerm() {
+		n.becomeFollowerLocked(resp.Term)
+		return false
+	}
+	if n.role != Leader || n.state.CurrentTerm() != term {
+		return false // a response for a term we no longer lead
+	}
+
+	// The follower now holds everything through the snapshot, so normal
+	// replication resumes right after it. max() because a reordered,
+	// delayed response must never move matchIndex backward.
+	if snapshot.LastIncludedIndex > n.matchIndex[peerID] {
+		n.matchIndex[peerID] = snapshot.LastIncludedIndex
+	}
+	n.nextIndex[peerID] = n.matchIndex[peerID] + 1
+	n.advanceCommitIndexLocked()
+	return resp.Term == term
+}
+
+// HandleInstallSnapshot replaces a lagging follower's state with the
+// leader's snapshot.
+//
+// INVARIANT: a failure to store the snapshot is returned as an ERROR, never
+// as a normal response. The response carries only a term — the Raft paper
+// assumes an install cannot fail, so a reply means success — and the leader
+// treats any reply in its own term as "this follower now holds everything
+// through the snapshot," setting matchIndex accordingly. Answering normally
+// after a failed disk write would credit this follower with entries it does
+// not have, and the leader could count it toward a majority for them:
+// Milestone 6's "committed on one machine," by a new route. An error takes
+// the leader's existing failure path instead — no credit, retry next tick.
+func (n *Node) HandleInstallSnapshot(req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// Term handling, identical to AppendEntries: reject a stale leader;
+	// adopt a higher term; a candidate that hears from this term's leader
+	// has lost and steps down.
+	if req.Term < n.state.CurrentTerm() {
+		return &raftpb.InstallSnapshotResponse{Term: n.state.CurrentTerm()}, nil
+	}
+	if req.Term > n.state.CurrentTerm() {
+		n.becomeFollowerLocked(req.Term)
+	} else if n.role == Candidate {
+		n.role = Follower
+	}
+	n.resetElectionTimerLocked() // it came from a legitimate leader
+
+	// INVARIANT: install only a snapshot that goes BEYOND our commitIndex,
+	// so commitIndex never moves backward.
+	//
+	// A snapshot at or below commitIndex is a delayed one: this follower
+	// caught up through ordinary replication while the RPC was in flight.
+	// Installing it would set commitIndex to the snapshot's index — BELOW
+	// what is committed, and possibly below lastApplied (observed with this
+	// check removed: commitIndex 2, lastApplied 3). It would also rewrite the
+	// log and snapshot files to gain nothing.
+	//
+	// This check is NOT what keeps delivery ordered when a snapshot lands
+	// while the applier is mid-batch. The applier does that by itself: it
+	// sends the snapshot only at the start of a pass, and only if
+	// lastApplied is still below it, and it is the only sender. A batch in
+	// flight finishes first; a snapshot it has already passed is never sent.
+	// (Mutation testing confirmed delivery stays strictly forward without
+	// this check.)
+	if req.LastIncludedIndex <= n.commitIndex {
+		// Not a failure: we already hold committed entries through this
+		// index, so the leader's "you have it" conclusion is true.
+		return &raftpb.InstallSnapshotResponse{Term: n.state.CurrentTerm()}, nil
+	}
+
+	snapshot := &Snapshot{
+		LastIncludedIndex: req.LastIncludedIndex,
+		LastIncludedTerm:  req.LastIncludedTerm,
+		Data:              req.Data,
+	}
+	// Saves first, then compacts: keeps entries after the snapshot if ours
+	// match it at its last index, discards everything otherwise.
+	if err := n.log.InstallSnapshot(snapshot); err != nil {
+		slog.Error("raft: failed to install snapshot from leader",
+			"node_id", n.id, "leader_id", req.LeaderId, "index", req.LastIncludedIndex, "error", err)
+		return nil, fmt.Errorf("raft: node %d failed to install snapshot at index %d: %w", n.id, req.LastIncludedIndex, err)
+	}
+
+	// Everything in the snapshot is committed. The applier sees lastApplied
+	// below the new snapshot and delivers it next.
+	n.commitIndex = req.LastIncludedIndex
+	n.signalApplierLocked()
+	return &raftpb.InstallSnapshotResponse{Term: n.state.CurrentTerm()}, nil
 }
