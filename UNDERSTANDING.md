@@ -2196,8 +2196,117 @@ was reopened.
   identical data, and skipped a retried request applied before the snapshot.
 - **Break 1:** deferred (see above).
 
-### Interview Questions and Answers
-Pending (Milestone 8 interview drill follows).
+### Interview Questions and Answers (Milestone 8 drill)
+
+**Q1. Restart with `snapshot.dat` at 293 and a log file holding 280–310.
+What does `OpenLog` keep? What if the file's entry 293 has term 4 but the
+snapshot says 5? How can entries before the snapshot end up in the file?**
+Answer: keeps 294–310 and drops 280–293. On a term mismatch, trust the
+snapshot (`TermAt(293)` returns 5). Old entries remain when the node saved
+the snapshot and crashed before compacting.
+**Needs more depth.** The first and third parts are right; the crash window
+between `SaveSnapshot` and `compactLocked` is exactly the legitimate case.
+Two things were missing:
+- Dropping is physical, not just logical: `rewriteLocked` rewrites the file,
+  finishing the interrupted compaction. Otherwise the next append would land
+  after stale entries.
+- On a term mismatch, **294–310 are discarded too**. `entriesAfterSnapshot`
+  returns nothing. Those entries were appended after a term-4 entry 293; by
+  Log Matching, a log that differs at 293 cannot be trusted after it. It is
+  safe because none of them can be committed: committed entries form one
+  prefix that includes term 5 at 293, and these sit on a branch that
+  contradicts it.
+
+**Q2. Make the strongest case for Raft, not the state machine, deciding when
+to compact. Then: what breaks if Raft snapshots from its own timer goroutine
+mid-apply?**
+Answer: Raft owns the log and can watch its size independently. A timer
+could snapshot halfway through applying, so the data wouldn't match its
+index; the snapshot must be exactly the state after `LastIncludedIndex`.
+**Needs more depth.** The second half is right; name both failure
+directions:
+- The data includes entry 101 but claims 100: a restore re-applies 101.
+- The data claims 101 but lacks it: that write is lost.
+
+The case for Raft deciding was weak. The strongest argument is that **only
+Raft knows replication progress (`matchIndex`)**. It can hold off compacting
+entries a nearly caught-up follower still needs, and avoid sending it a whole
+snapshot when a few entries would do. Our state machine compacts blind.
+
+**Q3. If the stale check doesn't order delivery, what does? Trace commitIndex
+3, log to 10 (uncommitted, some stale), snapshot at (7, term 6).**
+Answer: the single applier delivers sequentially and advances
+`lastApplied`. If entry 7 has term 6, discard 4–7 and keep 8–10; otherwise
+discard 4–10. Safe because they are uncommitted.
+**Needs more depth; the safety reasoning is wrong as stated.** The trace is
+right, and entries 1–3 go as well since the snapshot covers them. Two gaps:
+- The exact conditions: the applier sends a snapshot only at the **start of
+  a pass** and only if `lastApplied < snapshotIndex`. A batch already copied
+  (all at or below `commitIndex`) finishes first, so a snapshot can never be
+  followed by an entry it covers.
+- "Uncommitted, so discardable" is false in general. An uncommitted entry
+  this follower acknowledged may be one of the copies the leader is counting
+  toward a majority; discarding it is Milestone 6's ack-before-durable bug.
+  The real argument:
+  - If entry 7 *mismatches* the leader's committed entry 7, then by Log
+    Matching our 8–10 don't match the leader's either. This follower could
+    never have acknowledged them to the current leader, so no majority
+    depends on them.
+  - If 7 *matches*, 8–10 are kept but not committed (`commitIndex` becomes
+    7). Normal AppendEntries consistency checks will repair them later if
+    they conflict.
+
+**Q4. Why an error instead of a `success` field? What does the leader do in
+each case? The install succeeds but the reply is lost: what happens next?**
+Answer: an error reuses the leader's retry path without changing the proto.
+On success the leader updates its progress; on error it gives no credit and
+retries. On a lost reply the leader retries, and the follower sees it already
+committed through that index, ignores it, and replies normally.
+**Strong.** Correct trace: `commitIndex` is now 7, so the retry hits the
+stale check and the normal reply is *true*. Two additions:
+- The leader re-sends the **whole snapshot** to learn that. That costs
+  bandwidth, not correctness.
+- If the follower restarted in between, its `commitIndex` starts at
+  `SnapshotIndex()` (8b's init line), so the retry is still ignored.
+
+**Q5. 800 MB snapshot, follower offline for an hour: every failure, its
+production fix, and which ones take down the whole cluster?**
+Answer: a table covering the 4 MiB limit (chunking), memory (bounded
+buffers), heartbeats delayed by the transfer (separate them), the leader
+mutex held during network I/O (release it), and the follower's election
+timeout (reset on leader contact). Lock contention, heartbeat delay and
+memory exhaustion can take down the cluster; the follower's timeout usually
+affects only that follower.
+**Needs more depth; two claims are wrong about our code.**
+- *Wrong:* the leader does **not** hold `mu` during the transfer;
+  `replicateToPeer` unlocks before `sendSnapshot`. Where a lock IS held
+  through 800 MB of disk I/O:
+  - `Node.Snapshot` writes and fsyncs under `n.mu`. The leader stops
+    heartbeating, which triggers an election. That is cluster-wide.
+  - The follower's `HandleInstallSnapshot` does the same, but that only
+    affects the follower.
+- *Wrong:* the follower's timeout is **not** local. A unary handler runs
+  only after the whole message arrives, so the timer isn't reset during a
+  long transfer. The follower times out and campaigns with a higher term;
+  with no PreVote that **deposes the leader**, repeatedly, every transfer
+  attempt. Its stale log means it never wins, so the cluster churns through
+  elections. That is the cluster-wide failure. Fix: PreVote and CheckQuorum.
+- *Missed entirely:*
+  - **`rpcTimeout` is 100 ms.** 800 MB takes about 6 seconds even at
+    1 Gbps, so every attempt is cancelled and the follower can never catch
+    up, even if the size limit were raised. Fix: a separate, much longer
+    timeout or a streaming transfer.
+  - **Duplicate transfers.** Every 10 ms tick starts another send, and each
+    marshals another 800 MB copy, which is how memory actually blows up.
+    Fix: one snapshot in flight per follower (etcd pauses a follower's
+    progress tracker while a snapshot is in flight).
+  - The log keeps `snapshot.Data` resident in memory on every node,
+    permanently. Fix: stream the snapshot from disk.
+
+**Overall:** solid on the mechanics: what the code does, the traces, the
+retry path. Weaker on *why it is safe* (Q1's mismatch case, Q3's discard
+argument) and on judging cluster-wide impact (Q5). In interviews, the
+safety justification is the part that separates answers.
 
 ### Git Commit Message
 `feat: catch up lagging followers with InstallSnapshot`
@@ -2215,6 +2324,149 @@ Pending (Milestone 8 interview drill follows).
   duplicates no-ops), but wasteful for big snapshots.
 - **The Docker real-cluster run for 7 and 8 is still deferred**, and so is
   the 100k-write Break 1 measurement.
+
+---
+
+## Milestone 9a — The Consistent Hash Ring
+Date: 2026-10-17
+
+### The Problem This Solves
+One Raft group caps the system at one leader's write throughput, one
+machine's memory, and snapshots the size of the whole dataset. Sharding
+splits keys across several Raft groups, and every node and client then
+needs the same answer to "which group owns this key?" with no coordination
+at lookup time. 9a builds that answer: a deterministic consistent hash ring.
+
+### The Design Decision Made
+The Milestone 9 choices, made together:
+
+| Choice | Picked | Main alternative | Why, for our constraints |
+|---|---|---|---|
+| Key → shard | consistent hash ring, 100 points per group, SHA-256 truncated to 64 bits | fixed hash slots (Redis Cluster); modulo | CLAUDE.md names it; adding a group moves ~1/(N+1) of keys, only to the new group |
+| Placement | 3 groups on our 3 nodes (multi-Raft) | a separate 3-node set per group | keeps the 3-node cluster; the production architecture |
+| Routing | smart client sends a group ID, server checks it (`WRONG_GROUP`) | server forwarding; leader-hint redirects | one hop; a client/server ring mismatch becomes an error, not a wrong answer |
+| Map location | static `SHARD_GROUPS` | a config service Raft group | inside CLAUDE.md's "no automatic rebalancing" boundary |
+| Rebalancing | group count fixed at creation | an offline resharding tool | no half-finished migration can corrupt data |
+
+Honest costs, recorded on purpose:
+- With a fixed group count, the ring's headline benefit (little movement on
+  resize) never runs in the live system; modulo would route just as well.
+  The benefit is measured in tests and matters for a future resize.
+- Every node still holds every shard, so storage does not scale, and two
+  dead nodes still take every group down.
+- Because the map is not in the Raft log, the ownership check must happen
+  **before proposing, never while applying** (replicas with different
+  configs would apply differently, and diverge). That shapes 9c.
+
+**Hash function, chosen on measurement.** The point labels (`group-1#0`,
+`group-1#1`, ...) differ only in their last bytes.
+- FNV-1a: barely moves the high bits that decide ring position. Measured
+  6.5% / 28.5% / 65.0% with 100 points per group.
+- SHA-256 truncated to 64 bits: 33.6% / 31.9% / 34.5%, at about 300ns per
+  lookup.
+- `hash/maphash`: ruled out; its seed is random per process, so every node
+  would build a different ring.
+
+### How It Works — Plain English
+Picture a clock face with 2^64 positions instead of 12. Each group drops 100
+markers on it, at positions computed by hashing `group-<id>#<n>`. To find a
+key's owner, hash the key to a position and walk clockwise to the first
+marker; that marker's group owns the key. Walking past the top of the clock
+wraps back to the first marker.
+
+Many markers per group keep the arcs, and so the load, even. A new group's
+markers each take over a small arc from whichever group used to own it.
+Only those keys move, and they all move to the new group.
+
+The ring is built once and never changes, so any number of goroutines can
+use it without a lock.
+
+### Key Invariants
+- INVARIANT: a Ring is immutable once New returns; any number of goroutines
+  may call Owner concurrently with no mutex.
+- INVARIANT: the ring is a pure function of the SET of groups. The same set
+  gives an identical ring on every process, whatever order the groups were
+  listed in. The group-ID tie-break makes the sort a total order, even on a
+  64-bit position collision.
+- Compatibility contract (comments on `PointsPerGroup` and `hash`, pinned by
+  a test): the hash, the label format, the byte order and the point count
+  decide where every key lives. Changing any of them in a running cluster
+  makes existing data appear to vanish.
+
+### The Lines That Matter Most
+
+Line: `if i == len(r.points) { i = 0 }`
+Does: wraps past the last point to the first; makes the ring a circle.
+Breaks without it: B1, verified: `panic: index out of range [300] with
+length 300`. Not only in the wrap test: about 1 in 300 real keys hashes past
+the last point, so ordinary 10k-key tests panicked.
+Why this way: `sort.Search` returns `len` when nothing is `>=`, which is
+exactly the "past the last point" case.
+
+Line: `return points[a].group < points[b].group` (the tie-break in `sortPoints`)
+Does: orders two points with the same position the same way on every
+process.
+Breaks without it: B6. It **survived** the first test suite, because real
+SHA-256 positions never collide among 300 points. The comparator was moved
+into `sortPoints` so a test could build a collision by hand; then caught:
+`sorted to [{5 1} {5 2}] from one input order and [{5 2} {5 1}] from the
+other`.
+Why this way: `sort.Slice` is not stable, and even a stable sort would keep
+input order. A tie must be broken by something every process agrees on.
+
+Line: `return r.points[i].position >= position`
+Does: a position belongs to the first point AT or after it.
+Breaks if changed to `>`: B4. It **survived** at first, and my prediction
+(that the exact-position probe would catch it) was wrong. The probe used
+`points[1]`, whose next point happened to belong to the same group, so
+"this point" and "the next point" gave the same answer. The probe now picks
+a point whose successor is in a different group; caught.
+Why this way: either convention works if everyone uses the same one. `>=`
+matches `sort.Search`, and the pinned test fixes it as part of the contract.
+
+Line: `sum := sha256.Sum256([]byte(s)); return binary.BigEndian.Uint64(sum[:8])`
+Does: places strings on the ring deterministically.
+Breaks if swapped for FNV-1a: B2, verified: `group 1 owns 6.5% of keys`,
+exactly the Python model's prediction, and the pinned hash changed.
+Why this way: measured evenness; deterministic across processes; cost
+negligible next to fsync.
+
+Line: `const PointsPerGroup = 100`
+Does: sets the number of virtual nodes, and with it the balance.
+Breaks if changed to 200: B5. As predicted, the **balance test still
+passed**; only the pinned layout and the model cross-check caught it. That
+is exactly their job: a change can be "valid" and still destroy a deployed
+cluster's data placement.
+
+### What Breaks and Why
+All six breaks were caught on the final code. The two that first survived,
+B4 and B6, exposed test gaps, not code bugs, and both gaps were fixed. B3
+(forgetting to sort) failed six tests, including `"user:0" moved from group 2
+to group 1 — between two OLD groups`: a binary search over unsorted points
+returns garbage that merely looks plausible.
+
+### Verification Against an Independent Model
+The Go ring reproduced the Python model **exactly**: 33,617 / 31,887 /
+34,496 of 100k keys, and 23.0% moved when adding group 4, all of them to
+group 4. Modulo, measured in the same tests, moved 75.1% of keys, 50.1%
+between groups that already existed. The pinned owners and the pinned
+`hash("group-1#0")` come from the Python model, not from this code's own
+output.
+
+### Interview Questions and Answers
+Deferred to the end of Milestone 9.
+
+### Git Commit Message
+`feat: add consistent hash ring for mapping keys to shard groups`
+
+### Open Questions
+- **Hot keys.** No partitioning scheme spreads a single hot key.
+- **Leader placement.** Nothing makes the 3 groups' leaders land on
+  different nodes (9b). Without leader transfer, all three can end up on one
+  node.
+- **Resize is documented, not built (5A).** A real resize needs shard
+  handoff: freeze the shard, copy its data *and* dedup state, and check the
+  config version when each entry is applied.
 
 ---
 
