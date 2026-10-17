@@ -13,6 +13,18 @@ service Raft {
     rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
 }
 
+// Every request carries group_id (Milestone 9b): one process hosts several
+// Raft groups, one per shard, all served on the same port, and group_id is
+// how the receiving process picks which group's Node handles the message.
+//
+// Group IDs start at 1. In proto3 an unset field reads as 0, so a sender
+// that forgot to set group_id, or a binary from before sharding, sends
+// group 0 — which matches no group and is rejected, instead of being
+// handled by a real group it was never meant for.
+//
+// Responses carry no group_id: a reply returns on the same call as its
+// request, so it cannot be delivered to the wrong group.
+
 message RequestVoteRequest {
     uint64 term = 1;
     uint64 candidate_id = 2;
@@ -22,6 +34,7 @@ message RequestVoteRequest {
     // Choice 3, for why this avoids reopening this RPC's signature later.
     uint64 last_log_index = 3;
     uint64 last_log_term = 4;
+    uint64 group_id = 5;
 }
 
 message RequestVoteResponse {
@@ -49,6 +62,7 @@ message AppendEntriesRequest {
     // Milestone 5 — there is no separate heartbeat RPC.
     repeated LogEntry entries = 5;
     uint64 leader_commit = 6; // unused until Milestone 6
+    uint64 group_id = 7;
 }
 
 message AppendEntriesResponse {
@@ -69,6 +83,7 @@ message InstallSnapshotRequest {
     uint64 last_included_index = 3;
     uint64 last_included_term = 4;
     bytes data = 5; // opaque to Raft: the state machine's encoded state
+    uint64 group_id = 6;
 }
 
 message InstallSnapshotResponse {

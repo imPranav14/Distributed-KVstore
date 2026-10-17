@@ -2470,4 +2470,124 @@ Deferred to the end of Milestone 9.
 
 ---
 
+## Milestone 9b — Raft Transport for Many Groups
+Date: 2026-10-17
+
+### The Problem This Solves
+In 9c each process will host several Raft groups, one per shard, all
+behind one port. A Raft message must reach exactly the group it belongs to.
+Delivered to the wrong group, an AppendEntries would splice one log's
+entries into another, and no Raft check would notice: terms and indexes from
+two independent logs can line up by coincidence.
+
+### The Design Decision Made
+- **Sub-steps re-split by layer.** The original plan had 9b start three
+  groups in `main.go`, but routing keys to groups waits for 9c, so in between
+  every key would silently land in group 1. Now 9b is transport only, and
+  `main.go` runs a single group (group 1) *through* the new transport. Every
+  commit leaves a working system.
+- **`group_id` as a field in each request**, not gRPC metadata (untyped,
+  invisible, easy to forget) and not a port per group (9 ports, compose
+  churn). Responses carry none: a reply returns on its own call.
+- **Group 0 is reserved.** Proto3 reads an unset field as 0, so a sender
+  that forgot to stamp the ID, or a pre-sharding binary, matches no group
+  and fails loudly.
+- **`raft.Node` stays unaware of groups.** One wrapper (`groupPeer`) stamps
+  the ID on the way out; one dispatcher (`RaftServer`) routes on it on the
+  way in. Cost: the wrapper writes into the request object Raft handed it,
+  so the `Peer` interface now documents that each request is built for one
+  call and never shared. Copying field by field was rejected: a field added
+  to the proto later would be silently dropped.
+- **One connection per peer node, shared by all groups**
+  (`RaftPeerConn.ForGroup`). Connections grow with nodes, not nodes ×
+  groups. `DialRaftPeer` returns a type with `Close`, so tests and shutdown
+  don't leak gRPC goroutines (Rule 5); the pseudocode's bare stub had no way
+  to close.
+
+### How It Works — Plain English
+Think of one building (a process) with several offices (groups) sharing one
+mailroom (the port). Every outgoing letter is stamped with the sending
+office's number, and the receiving mailroom delivers each letter only to the
+office with that number. A letter with no number (group 0), or a number for
+an office that isn't in the building, is returned to the sender; it is never
+handed to whoever happens to be nearest. Between two buildings there is one
+courier route (connection) shared by every office.
+
+### Key Invariants
+- INVARIANT (`raft_server.go`, `nodeFor`): a Raft message is handled only by
+  the group it names. A group this process doesn't host, including group 0,
+  is refused rather than handed to any group.
+- INVARIANT (`raft_peer_client.go`): every outgoing Raft request names this
+  peer's group; `raft.Node` never sets it.
+- `RaftServer.nodes` is copied at construction and read-only afterwards, so
+  handlers on many gRPC goroutines read it without a mutex (Rule 7).
+- `Peer` contract (`node.go`): a request is built for a single call and
+  never reused, which is what makes stamping it in place safe.
+
+### The Lines That Matter Most
+
+Line: `node, hosted := s.nodes[ring.GroupID(groupID)]` in `nodeFor`
+Does: routes by the requested group.
+Breaks if hard-coded to group 1 (B1, verified):
+- Group 2's entry went to group 1 (`group 2 did not receive its own entry`).
+- Groups 0 and 7 were *handled* (`error = <nil>, want NotFound`).
+- Over real gRPC, group 2 never elected a leader: all its messages,
+  including its own vote requests, landed in group 1's nodes.
+
+The misrouting surfaced as an outage before it could surface as corruption.
+In a subtler bug, say routing only some RPC types wrongly, corruption would
+come first.
+
+Line: `req.GroupId = uint64(p.group)` (in all three `groupPeer` methods)
+Does: names the sending group on every request.
+Breaks without it (B2, verified): `group IDs sent = [0 0 0]`, and over real
+gRPC no group ever elected a leader. Every message arrived as group 0 and
+was refused, which is exactly the loud failure that reserving 0 buys.
+Why this way: Raft builds a fresh request per call (`election.go:108`,
+`replication.go:281`, `snapshot.go:109`), so stamping in place costs nothing
+and can't drop a field.
+
+Line: `if _, hasZero := nodes[0]; hasZero { return error }` in `NewRaftServer`
+Does: refuses to host a group that unset fields would match.
+Breaks without it (B3, verified): only its construction test fails. In the
+running system, a group 0 would quietly receive every unstamped or
+pre-sharding message.
+
+Line: `copied := make(...); for group, node := range nodes { copied[group] = node }`
+Does: makes the routing table immune to the caller changing its map later.
+Breaks without it (B4): **survived the first suite**, as predicted, because
+no test changed the map after construction. A test now deletes and adds
+groups in the caller's map, and routing must not change; then caught.
+
+### What Breaks and Why
+All four breaks were caught on the final code. B4 needed a new test; B1
+failed differently than predicted (an outage rather than mixed values), for
+the reason above.
+
+### Verification
+- The real-gRPC test: 3 processes on localhost, each hosting groups 1 and 2
+  behind one port with shared connections. Each group elected its own leader
+  and replicated only its own write (`x=one` in group 1, `x=two` in group 2).
+  20/20 runs passed.
+- A real-binary smoke run: three `node` processes on localhost elected a
+  leader in term 1 through the stamped, dispatched transport, with no group
+  errors. That verifies `main.go`'s wiring, which no unit test covers.
+
+### Interview Questions and Answers
+Deferred to the end of Milestone 9.
+
+### Git Commit Message
+`feat: carry group IDs on Raft RPCs and dispatch them to per-group nodes`
+
+### Open Questions
+- **A mixed-version cluster can't run.** Pre-9b nodes send group 0 and get
+  refused. Fail-safe, but an upgrade means stopping every node at once.
+- **Heartbeat traffic will multiply by the number of groups** in 9c, since
+  each group heartbeats on its own. Production multi-Raft systems
+  (CockroachDB) coalesce heartbeats per node pair.
+- **Log lines don't say which group they come from yet.** Harmless with one
+  group; 9c adds a group label before running several.
+
+---
+
 <!-- All future entries go below this line, in chronological order -->

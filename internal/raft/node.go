@@ -28,6 +28,12 @@ const (
 // entirely in-process, with fake Peers calling directly into other Node
 // instances' handler methods — Milestone 5c's real gRPC client is just a
 // thin implementation of this same interface.
+//
+// Contract: every request passed to a Peer is built for that single call
+// and never reused or shared with another call, so an implementation may
+// write transport fields into it. The gRPC peer relies on this to stamp
+// group_id (Milestone 9b). A future change that sends ONE request object to
+// several peers must copy it per peer first.
 type Peer interface {
 	RequestVote(ctx context.Context, req *raftpb.RequestVoteRequest) (*raftpb.RequestVoteResponse, error)
 	AppendEntries(ctx context.Context, req *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error)

@@ -20,11 +20,17 @@ import (
 	"github.com/imPranav14/Distributed-KVstore/internal/config"
 	"github.com/imPranav14/Distributed-KVstore/internal/dedup"
 	"github.com/imPranav14/Distributed-KVstore/internal/raft"
+	"github.com/imPranav14/Distributed-KVstore/internal/ring"
 	"github.com/imPranav14/Distributed-KVstore/internal/server"
 	"github.com/imPranav14/Distributed-KVstore/internal/store"
 	kvpb "github.com/imPranav14/Distributed-KVstore/proto/kv"
 	raftpb "github.com/imPranav14/Distributed-KVstore/proto/raft"
 )
+
+// onlyGroup is the single Raft group this binary runs until Milestone 9c
+// starts one group per shard. It is 1, not 0: group 0 is reserved for "the
+// sender never set group_id" and is refused by every RaftServer.
+const onlyGroup ring.GroupID = 1
 
 func main() {
 	cfg, err := config.Load()
@@ -73,14 +79,19 @@ func main() {
 	// block waiting for peers to be up, which matters since docker-compose
 	// starts all three containers at roughly the same time and none of
 	// them are guaranteed to be listening yet.
+	//
+	// One connection per peer node. In 9c every group on this node shares
+	// it; ForGroup gives each group a Peer that stamps its group_id.
 	peers := make(map[uint64]raft.Peer, len(cfg.PeerAddrs))
+	peerConns := make([]*server.RaftPeerConn, 0, len(cfg.PeerAddrs))
 	for peerID, addr := range cfg.PeerAddrs {
-		peerClient, err := server.NewRaftPeerClient(addr)
+		peerConn, err := server.DialRaftPeer(addr)
 		if err != nil {
 			slog.Error("node: failed to create raft peer client", "peer_id", peerID, "addr", addr, "error", err)
 			os.Exit(1)
 		}
-		peers[peerID] = peerClient
+		peerConns = append(peerConns, peerConn)
+		peers[peerID] = peerConn.ForGroup(onlyGroup)
 	}
 
 	// The replicated state machine starts EMPTY — store and dedup table
@@ -111,7 +122,11 @@ func main() {
 	}
 
 	kvServer := server.NewKVServer(raftNode, stateMachine)
-	raftServer := server.NewRaftServer(raftNode)
+	raftServer, err := server.NewRaftServer(map[ring.GroupID]*raft.Node{onlyGroup: raftNode})
+	if err != nil {
+		slog.Error("node: failed to create raft server", "error", err)
+		os.Exit(1)
+	}
 
 	grpcServer := grpc.NewServer()
 	kvpb.RegisterKVStoreServer(grpcServer, kvServer)
@@ -150,6 +165,12 @@ func main() {
 	// applyWaitTimeout each.
 	raftNode.Stop()
 	grpcServer.GracefulStop()
+
+	for _, peerConn := range peerConns {
+		if err := peerConn.Close(); err != nil {
+			slog.Error("node: failed to close raft peer connection", "error", err)
+		}
+	}
 
 	if err := raftLog.Close(); err != nil {
 		slog.Error("node: failed to close raft log", "error", err)
