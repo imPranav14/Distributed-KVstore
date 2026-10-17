@@ -2736,4 +2736,139 @@ Deferred to the end of Milestone 9.
 
 ---
 
+## Milestone 9d — Each Node Runs SHARD_GROUPS Groups
+Date: 2026-10-18
+
+### The Problem This Solves
+9b and 9c made a process *able* to host several groups; 9d makes every node
+actually run `SHARD_GROUPS` of them, each with its own durable state. It also
+enforces 9's choice 5A, "the group count is fixed at creation", instead of
+merely documenting it. Changing the count is not a config change but a data
+migration. Going from 3 to 4 groups sends about 23% of keys (measured in 9a)
+to a new, empty group 4: reads for them return "not found" while their data
+sits on disk in the old groups, and new writes create second copies.
+
+### The Design Decision Made
+- **`SHARD_GROUPS` is required, with no default.** A default silently applied
+  on one node that forgot to set it is exactly the ring mismatch the system
+  defends against.
+- **The count is pinned in `DATA_DIR/shard-groups`** on first start, written
+  atomically (temp, fsync, rename, fsync dir). Every later start must match,
+  or the node refuses to boot, naming both counts.
+  - Rejected: inferring the count from existing `group-N` directories. A
+    crash partway through creating them is ambiguous.
+  - Rejected: no guard.
+- **A data directory from before sharding is refused.** Its single group's
+  files sit at the root; treating it as fresh would make every old key look
+  lost.
+- **Layout:** `DATA_DIR/group-<g>/{raft-state.dat, raft-log.dat,
+  snapshot.dat}`.
+- **Log labels via `raft.WithLogger`**, an optional constructor argument. It
+  is set before any goroutine exists, so there is no race, and the 9
+  existing `NewNode` callers are unchanged. Only Raft's 6 lines are
+  labelled; the state machine's 2 rare error lines wait for Milestone 10.
+- **The whole process fails fast** if any group's state machine fails: a
+  possibly diverged replica in *any* group must not keep serving.
+- **Placement:** `PinShardGroups` lives in `config` as the one config value
+  that is also persisted. It duplicates `raft`'s ~25-line atomic-write
+  pattern rather than exporting it from the consensus package.
+
+### How It Works — Plain English
+On startup the node checks a small file in its data directory. If the file
+doesn't exist, the directory is brand new: the node records the group count
+and continues. If it exists and says the same count, it continues. If it
+says something else, the node stops with a message saying what the
+directory was created with.
+
+Then, for each group 1..N, the node opens that group's own subdirectory,
+builds a Raft node and state machine for it, and gives it its own view of
+the shared connections to the other nodes. One gRPC port serves all groups:
+9b's dispatcher routes Raft messages, and 9c's KV server routes client
+requests. Every Raft log line carries `group_id`.
+
+### Key Invariants
+- INVARIANT (`main.go`): the group count is pinned BEFORE any group
+  directory is created, so a crash between the two leaves no group data the
+  pinned count doesn't describe. **Argued, not tested:** it is an ordering
+  inside `main`, which no unit test reaches.
+- `PinShardGroups`: a data directory only ever runs with the count it was
+  created with; a pre-sharding directory or a corrupt marker is refused.
+- `Node.logger` is set once in `NewNode` and never written again, so it is
+  read without `mu`.
+- Every group has its own directory (see break B3 for why).
+
+### The Lines That Matter Most
+
+Line: `if recorded != shardGroups { return error }` in `PinShardGroups`
+Does: refuses to start with a different group count than the directory was
+created with.
+Breaks without it (B1, verified twice):
+- The test fails (`restart with SHARD_GROUPS=4 on a 3-group data dir
+  succeeded`).
+- The **real binary** restarted happily with 4 groups and created an empty
+  `group-4/` beside the others: the silent stranding of about 23% of keys,
+  live.
+
+Line: the `preShardingFiles` check before writing a fresh marker
+Does: refuses a directory whose single group sits at the root.
+Breaks without it (B2, verified): all three file cases were accepted as
+fresh.
+
+Line: `groupDir := filepath.Join(cfg.DataDir, fmt.Sprintf("group-%d", group))`
+Does: gives each group its own log, state and snapshot files.
+Breaks if every group uses `DATA_DIR` (B3, real binaries, verified):
+- All three groups still elected leaders; nothing looked wrong while
+  running.
+- On restart: `log entry at offset 20 has index 1, want 2 (log is corrupt or
+  non-contiguous)`. Offset 20 is right after the first 20-byte entry with an
+  empty no-op command. The next entry was another group's no-op, also at
+  index 1.
+- Worse than the visible error: while running, three groups were replacing
+  each other's `raft-state.dat`, so one group's term and vote could be read
+  back as another's. That is a safety violation, and it is silent until
+  restart.
+
+Line: `raft.WithLogger(logger)` with `logger := slog.With("group_id", group)`
+Does: labels each group's Raft log lines.
+Verified: a test checks the label appears; the real-binary run showed
+`group_id=1`, `2` and `3` on election lines.
+
+### What Breaks and Why
+All three breaks behaved as predicted. B1 and B3 were run as real mutant
+binaries through a restart, which is the only place their damage shows.
+
+### Verification — Real Binaries
+Three `node` processes with `SHARD_GROUPS=3` on localhost:
+1. Every group elected a leader in term 1.
+   - group 1 → node 3
+   - group 2 → node 2
+   - group 3 → node 2
+
+   **Leaders did not spread:** node 1 led nothing. That is the
+   leader-placement gap, observed for real.
+2. Node 1's data directory held `group-1/ group-2/ group-3/ shard-groups`,
+   and the marker read `3`.
+3. Restarted with `SHARD_GROUPS=4`: exited with code 1 and the pin error.
+4. Restarted with `SHARD_GROUPS=3`: rejoined all three groups.
+5. A directory with a root-level `raft-log.dat` exited with code 1: `holds
+   raft-log.dat from before sharding`.
+
+### Interview Questions and Answers
+Deferred to the end of Milestone 9.
+
+### Git Commit Message
+`feat: run SHARD_GROUPS Raft groups per node with pinned per-group data dirs`
+
+### Open Questions
+- **Leader placement.** In the smoke run, one node led two groups and
+  another led none, so throughput doesn't spread by itself. Fixes: leader
+  transfer (Raft §3.10, TimeoutNow) plus a balancer.
+- **Heartbeats multiply by the group count**, all over the same connection.
+  Production multi-Raft systems batch them per node pair.
+- **The state machine's 2 error lines are still unlabelled** (Milestone 10).
+- **Upgrading from pre-sharding data means wiping it.** That is fine for
+  this project; a real system needs a migration tool.
+
+---
+
 <!-- All future entries go below this line, in chronological order -->

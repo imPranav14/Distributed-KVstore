@@ -2,6 +2,8 @@ package config
 
 import (
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -43,9 +45,10 @@ func registerEnvRestore(t *testing.T, key string) {
 
 func baseEnv() map[string]string {
 	return map[string]string{
-		"NODE_ID":   "1",
-		"GRPC_PORT": "50051",
-		"DATA_DIR":  "/data/node1",
+		"NODE_ID":      "1",
+		"GRPC_PORT":    "50051",
+		"DATA_DIR":     "/data/node1",
+		"SHARD_GROUPS": "3",
 	}
 }
 
@@ -127,6 +130,7 @@ func TestLoad_MissingRequiredVars_ReturnsSpecificError(t *testing.T) {
 		{"missing NODE_ID", "NODE_ID"},
 		{"missing GRPC_PORT", "GRPC_PORT"},
 		{"missing DATA_DIR", "DATA_DIR"},
+		{"missing SHARD_GROUPS", "SHARD_GROUPS"},
 	}
 
 	for _, tt := range tests {
@@ -193,5 +197,99 @@ func TestLoad_SnapshotThreshold_OverrideAndValidation(t *testing.T) {
 				t.Fatalf("SNAPSHOT_THRESHOLD_BYTES=%q accepted, want an error", bad)
 			}
 		})
+	}
+}
+
+// This test checks that SHARD_GROUPS is parsed into the group list every
+// process builds its ring from — 1..N, never starting at 0, which is
+// reserved for "group_id not set" — and that a value that could silently
+// produce a different ring (non-integer, zero, negative) is refused.
+func TestLoad_ShardGroups_ParsedIntoGroupsAndValidated(t *testing.T) {
+	setEnv(t, baseEnv())
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	groups := cfg.Groups()
+	if len(groups) != 3 || groups[0] != 1 || groups[1] != 2 || groups[2] != 3 {
+		t.Fatalf("Groups() = %v, want [1 2 3]", groups)
+	}
+
+	for _, bad := range []string{"three", "0", "-1"} {
+		env := baseEnv()
+		env["SHARD_GROUPS"] = bad
+		setEnv(t, env)
+		if _, err := Load(); err == nil {
+			t.Fatalf("Load with SHARD_GROUPS=%q: err = nil, want an error", bad)
+		}
+	}
+}
+
+// This test checks the first and second start of a data directory: the
+// first records the group count, and a restart with the SAME count passes.
+func TestPinShardGroups_RecordsCountAndAcceptsTheSameCountAgain(t *testing.T) {
+	dir := t.TempDir()
+	if err := PinShardGroups(dir, 3); err != nil {
+		t.Fatalf("first PinShardGroups: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, shardGroupsFile))
+	if err != nil || strings.TrimSpace(string(raw)) != "3" {
+		t.Fatalf("marker = %q, %v; want \"3\"", raw, err)
+	}
+	if err := PinShardGroups(dir, 3); err != nil {
+		t.Fatalf("restart with the same count: %v", err)
+	}
+}
+
+// This test checks the INVARIANT that the group count is fixed when the
+// data directory is created. Restarting with 4 groups would move about a
+// quarter of all keys to a brand-new, empty group 4: their data still on
+// disk in the old groups, unreachable, and new writes making second copies.
+// The refusal must name both counts so an operator knows what to restore.
+func TestPinShardGroups_RefusesAChangedCount(t *testing.T) {
+	dir := t.TempDir()
+	if err := PinShardGroups(dir, 3); err != nil {
+		t.Fatalf("PinShardGroups: %v", err)
+	}
+
+	err := PinShardGroups(dir, 4)
+	if err == nil {
+		t.Fatalf("restart with SHARD_GROUPS=4 on a 3-group data dir succeeded")
+	}
+	if !strings.Contains(err.Error(), "SHARD_GROUPS=3") || !strings.Contains(err.Error(), "4") {
+		t.Fatalf("error %q should name both the recorded count (3) and the new one (4)", err)
+	}
+}
+
+// This test checks that a data directory from before sharding — its single
+// group's files at the root — is refused, not treated as fresh. Treating it
+// as fresh would start empty groups beside the old files, and every key
+// written before the upgrade would look lost.
+func TestPinShardGroups_RefusesPreShardingData(t *testing.T) {
+	for _, name := range []string{"raft-state.dat", "raft-log.dat", "snapshot.dat"} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, name), []byte("old"), 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			if err := PinShardGroups(dir, 3); err == nil {
+				t.Fatalf("a data dir with a root-level %s was accepted as fresh", name)
+			}
+			if _, err := os.Stat(filepath.Join(dir, shardGroupsFile)); !os.IsNotExist(err) {
+				t.Fatalf("a marker was written into a refused pre-sharding data dir")
+			}
+		})
+	}
+}
+
+// This test checks that an unreadable marker is an error. Treating it as
+// "no marker" would re-pin whatever count this start happens to use.
+func TestPinShardGroups_RefusesACorruptMarker(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, shardGroupsFile), []byte("three\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := PinShardGroups(dir, 3); err == nil {
+		t.Fatalf("a corrupt marker was accepted")
 	}
 }

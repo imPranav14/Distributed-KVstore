@@ -7,8 +7,11 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/imPranav14/Distributed-KVstore/internal/ring"
 )
 
 // Config holds everything a node needs to know about itself and its peers
@@ -43,6 +46,24 @@ type Config struct {
 	// takes a snapshot and compacts the log. Optional
 	// (SNAPSHOT_THRESHOLD_BYTES); defaults to DefaultSnapshotThresholdBytes.
 	SnapshotThresholdBytes int64
+
+	// ShardGroups is how many Raft groups — shards — every node runs
+	// (Milestone 9). Required, with no default: it decides which group owns
+	// every key, so a default silently applied on one node that forgot to
+	// set it would be exactly the ring mismatch the system defends against.
+	// It is also pinned in the data directory (PinShardGroups), because
+	// changing it later would strand existing data.
+	ShardGroups int
+}
+
+// Groups returns the IDs of this cluster's shard groups: 1..ShardGroups.
+// They start at 1 because group 0 is reserved for "group_id was not set".
+func (c *Config) Groups() []ring.GroupID {
+	groups := make([]ring.GroupID, c.ShardGroups)
+	for i := range groups {
+		groups[i] = ring.GroupID(i + 1)
+	}
+	return groups
 }
 
 // DefaultSnapshotThresholdBytes is 1 MiB: small enough that compaction
@@ -50,7 +71,7 @@ type Config struct {
 // snapshotting after every handful of writes.
 const DefaultSnapshotThresholdBytes = 1 << 20
 
-// Load reads NODE_ID, PEER_ADDRS, GRPC_PORT, and DATA_DIR from the process
+// Load reads NODE_ID, PEER_ADDRS, GRPC_PORT, DATA_DIR and SHARD_GROUPS from the process
 // environment and returns a validated Config. It returns an error naming the
 // specific variable that is missing or malformed, so a misconfigured
 // container fails fast at startup instead of failing confusingly later.
@@ -97,6 +118,15 @@ func Load() (*Config, error) {
 		}
 	}
 
+	shardGroupsRaw := os.Getenv("SHARD_GROUPS")
+	if shardGroupsRaw == "" {
+		return nil, fmt.Errorf("config: required env var SHARD_GROUPS is not set")
+	}
+	shardGroups, err := strconv.Atoi(shardGroupsRaw)
+	if err != nil || shardGroups <= 0 {
+		return nil, fmt.Errorf("config: SHARD_GROUPS=%q is not a positive integer", shardGroupsRaw)
+	}
+
 	snapshotThreshold := int64(DefaultSnapshotThresholdBytes)
 	if raw := os.Getenv("SNAPSHOT_THRESHOLD_BYTES"); raw != "" {
 		parsed, err := strconv.ParseInt(raw, 10, 64)
@@ -113,5 +143,100 @@ func Load() (*Config, error) {
 		DataDir:   dataDir,
 
 		SnapshotThresholdBytes: snapshotThreshold,
+		ShardGroups:            shardGroups,
 	}, nil
+}
+
+// shardGroupsFile, inside DATA_DIR, records the group count the directory
+// was created with.
+const shardGroupsFile = "shard-groups"
+
+// preShardingFiles are the files a node from before Milestone 9 kept at the
+// ROOT of its data directory, for its single Raft group. From 9d on they
+// live in one group-<id> subdirectory per group.
+var preShardingFiles = []string{"raft-state.dat", "raft-log.dat", "snapshot.dat"}
+
+// PinShardGroups makes the group count part of the data directory: recorded
+// on first use, and required to match on every start after that.
+//
+// This is the one piece of configuration that is also persisted, because
+// changing it is not a configuration change — it is a data migration. Going
+// from 3 groups to 4 sends about a quarter of all keys to a new, empty
+// group 4: their data sits on disk in the old groups, unreachable, and new
+// writes create second copies. Resharding is not supported (Milestone 9,
+// choice 5A), so a mismatch refuses to start rather than doing that.
+//
+// INVARIANT: main.go calls this BEFORE creating any group directory, so a
+// crash between the two leaves no group data that the marker does not
+// describe.
+func PinShardGroups(dataDir string, shardGroups int) error {
+	markerPath := filepath.Join(dataDir, shardGroupsFile)
+	raw, err := os.ReadFile(markerPath)
+
+	switch {
+	case err == nil:
+		recorded, parseErr := strconv.Atoi(strings.TrimSpace(string(raw)))
+		if parseErr != nil {
+			return fmt.Errorf("config: PinShardGroups: %s holds %q, not a group count (corrupt)", markerPath, raw)
+		}
+		if recorded != shardGroups {
+			return fmt.Errorf("config: PinShardGroups: data dir %s was created with SHARD_GROUPS=%d; starting with %d "+
+				"would send keys to other groups and make existing data unreachable. Resharding is not supported: "+
+				"restore SHARD_GROUPS=%d, or wipe the data dir", dataDir, recorded, shardGroups, recorded)
+		}
+		return nil
+
+	case os.IsNotExist(err):
+		for _, name := range preShardingFiles {
+			if _, statErr := os.Stat(filepath.Join(dataDir, name)); statErr == nil {
+				return fmt.Errorf("config: PinShardGroups: data dir %s holds %s from before sharding; "+
+					"migrating it is not supported — wipe the data dir", dataDir, name)
+			}
+		}
+		return writeFileAtomically(dataDir, markerPath, []byte(strconv.Itoa(shardGroups)+"\n"))
+
+	default:
+		return fmt.Errorf("config: PinShardGroups: failed to read %s: %w", markerPath, err)
+	}
+}
+
+// writeFileAtomically replaces path with data so that a crash at any moment
+// leaves either no file or the complete one: temp file, fsync, rename, then
+// fsync the directory so the rename itself survives a crash. The same
+// pattern as raft.SaveSnapshot.
+func writeFileAtomically(dir, path string, data []byte) error {
+	temp, err := os.CreateTemp(dir, filepath.Base(path)+"-*.tmp")
+	if err != nil {
+		return fmt.Errorf("config: failed to create temp file for %s: %w", path, err)
+	}
+	tempPath := temp.Name()
+
+	if _, err := temp.Write(data); err != nil {
+		temp.Close()
+		os.Remove(tempPath)
+		return fmt.Errorf("config: failed to write %s: %w", tempPath, err)
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		os.Remove(tempPath)
+		return fmt.Errorf("config: failed to fsync %s: %w", tempPath, err)
+	}
+	if err := temp.Close(); err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("config: failed to close %s: %w", tempPath, err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("config: failed to rename %s into place: %w", path, err)
+	}
+
+	dirHandle, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("config: failed to open %s to fsync it: %w", dir, err)
+	}
+	defer dirHandle.Close()
+	if err := dirHandle.Sync(); err != nil {
+		return fmt.Errorf("config: failed to fsync directory %s: %w", dir, err)
+	}
+	return nil
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -199,7 +198,7 @@ func (n *Node) HandleInstallSnapshot(req *raftpb.InstallSnapshotRequest) (*raftp
 	// Saves first, then compacts: keeps entries after the snapshot if ours
 	// match it at its last index, discards everything otherwise.
 	if err := n.log.InstallSnapshot(snapshot); err != nil {
-		slog.Error("raft: failed to install snapshot from leader",
+		n.logger.Error("raft: failed to install snapshot from leader",
 			"node_id", n.id, "leader_id", req.LeaderId, "index", req.LastIncludedIndex, "error", err)
 		return nil, fmt.Errorf("raft: node %d failed to install snapshot at index %d: %w", n.id, req.LastIncludedIndex, err)
 	}

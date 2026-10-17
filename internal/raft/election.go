@@ -3,7 +3,6 @@ package raft
 import (
 	"context"
 	"fmt"
-	"log/slog"
 
 	raftpb "github.com/imPranav14/Distributed-KVstore/proto/raft"
 )
@@ -88,13 +87,13 @@ func (n *Node) startElection() {
 		won := n.becomeLeaderLocked(electionTerm)
 		n.mu.Unlock()
 		if won {
-			slog.Info("raft: elected leader (single-node cluster)", "node_id", n.id, "term", electionTerm)
+			n.logger.Info("raft: elected leader (single-node cluster)", "node_id", n.id, "term", electionTerm)
 		}
 		return
 	}
 	n.mu.Unlock()
 
-	slog.Info("raft: starting election", "node_id", n.id, "term", electionTerm, "last_log_index", lastLogIndex, "last_log_term", lastLogTerm)
+	n.logger.Info("raft: starting election", "node_id", n.id, "term", electionTerm, "last_log_index", lastLogIndex, "last_log_term", lastLogTerm)
 
 	votes := 1 // ourselves
 	voteCh := make(chan bool, len(peers))
@@ -143,7 +142,7 @@ func (n *Node) startElection() {
 			won := n.becomeLeaderLocked(electionTerm)
 			n.mu.Unlock()
 			if won {
-				slog.Info("raft: elected leader", "node_id", n.id, "term", electionTerm, "votes", votes)
+				n.logger.Info("raft: elected leader", "node_id", n.id, "term", electionTerm, "votes", votes)
 				n.replicateToAll() // immediately — don't wait for the next tick
 			}
 			return
@@ -168,7 +167,7 @@ func (n *Node) becomeLeaderLocked(electionTerm uint64) bool {
 	n.initializeLeaderStateLocked()
 
 	if err := n.appendNoOpLocked(electionTerm); err != nil {
-		slog.Error("raft: won election but could not write no-op; stepping down",
+		n.logger.Error("raft: won election but could not write no-op; stepping down",
 			"node_id", n.id, "term", electionTerm, "error", err)
 		// INVARIANT: step down WITHOUT becomeFollowerLocked. That helper
 		// persists (term, NoVote), which would erase this node's vote for

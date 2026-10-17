@@ -115,6 +115,22 @@ type Node struct {
 	applyNotify chan struct{}
 
 	stopCh chan struct{} // closed by Stop(); read by run()'s select loop
+
+	// logger writes this node's log lines. Set once in NewNode, before any
+	// goroutine exists, and never written again — so it is read without mu.
+	// Since Milestone 9 a process runs one node per shard group, and the
+	// logger carries the group label that tells their lines apart.
+	logger *slog.Logger
+}
+
+// Option configures a Node at construction.
+type Option func(*Node)
+
+// WithLogger makes the node write its log lines through logger — typically
+// slog.With("group_id", g), so each shard group's lines are labelled.
+// Without it the node uses slog.Default().
+func WithLogger(logger *slog.Logger) Option {
+	return func(n *Node) { n.logger = logger }
 }
 
 // ApplyMsg is one thing delivered to the state machine: either a committed
@@ -143,7 +159,10 @@ type ApplyMsg struct {
 // applyCh receives every committed entry in order once Start() is called.
 // The caller must keep reading it: Raft never blocks on it while holding
 // its lock, but an unread channel does stall application of new entries.
-func NewNode(id uint64, state *State, log *Log, peers map[uint64]Peer, applyCh chan<- ApplyMsg) *Node {
+//
+// options are applied before the node is returned — before Start, and
+// before any handler can be called — so they never race with anything.
+func NewNode(id uint64, state *State, log *Log, peers map[uint64]Peer, applyCh chan<- ApplyMsg, options ...Option) *Node {
 	n := &Node{
 		id:          id,
 		peers:       peers,
@@ -168,6 +187,11 @@ func NewNode(id uint64, state *State, log *Log, peers map[uint64]Peer, applyCh c
 		// commit. It is kept because the invariant is cheap and every other
 		// reader of commitIndex is entitled to assume it.
 		commitIndex: log.SnapshotIndex(),
+
+		logger: slog.Default(),
+	}
+	for _, option := range options {
+		option(n)
 	}
 	n.resetElectionTimerLocked()
 	return n
@@ -246,7 +270,7 @@ func (n *Node) run() {
 // cast in term 4 must never be mistaken for a vote in term 5. This is why
 // Save is called with NoVote here rather than leaving votedFor untouched.
 func (n *Node) becomeFollowerLocked(term uint64) {
-	slog.Info("raft: becoming follower", "node_id", n.id, "term", term)
+	n.logger.Info("raft: becoming follower", "node_id", n.id, "term", term)
 	n.role = Follower
 	n.state.Save(term, NoVote)
 	n.resetElectionTimerLocked()
