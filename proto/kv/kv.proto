@@ -4,8 +4,9 @@ package kv;
 
 option go_package = "github.com/imPranav14/Distributed-KVstore/proto/kv;kvpb";
 
-// KVStore is the client-facing service. At this milestone each node serves
-// requests against its own local store — no replication or consensus yet.
+// KVStore is the client-facing service. Every request is served by the Raft
+// group that owns its key (Milestone 9c); writes are replicated through that
+// group's log and reads are linearizable within it.
 service KVStore {
     rpc Get(GetRequest) returns (GetResponse);
     rpc Put(PutRequest) returns (PutResponse);
@@ -17,6 +18,7 @@ service KVStore {
 // never goes through the server's dedup table.
 message GetRequest {
     string key = 1;
+    uint64 group_id = 2;
 }
 
 message GetResponse {
@@ -24,6 +26,13 @@ message GetResponse {
     bool found = 2;
 }
 
+// group_id (Milestone 9c) is the shard group the CLIENT computed for the
+// key from its own copy of the ring. The server checks it against its own
+// ring and refuses a mismatch with FailedPrecondition, before proposing
+// anything. A client and server that disagree about the ring therefore get
+// an error instead of a write landing in a group no correct read will look
+// in. Group IDs start at 1: 0 means "not set" and is always refused.
+//
 // INVARIANT: once a field number below is used in a released version of
 // this file, it must never be reused for a different field, even if the
 // field is renamed — protobuf's wire format identifies fields by number,
@@ -35,6 +44,7 @@ message PutRequest {
     string value = 2;
     string client_id = 3;
     uint64 request_id = 4;
+    uint64 group_id = 5;
 }
 
 // Empty: store.Store.Put has no return value, and gRPC's own status code
@@ -45,6 +55,7 @@ message DeleteRequest {
     string key = 1;
     string client_id = 2;
     uint64 request_id = 3;
+    uint64 group_id = 4;
 }
 
 // Empty, same reasoning as PutResponse.

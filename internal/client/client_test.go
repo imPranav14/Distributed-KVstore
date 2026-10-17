@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"path/filepath"
 	"sync"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/imPranav14/Distributed-KVstore/internal/dedup"
 	"github.com/imPranav14/Distributed-KVstore/internal/raft"
+	"github.com/imPranav14/Distributed-KVstore/internal/ring"
 	"github.com/imPranav14/Distributed-KVstore/internal/server"
 	"github.com/imPranav14/Distributed-KVstore/internal/store"
 	kvpb "github.com/imPranav14/Distributed-KVstore/proto/kv"
@@ -38,13 +40,27 @@ func startTestServer(t *testing.T) (addr string) {
 // RequestId value arrives on each retry attempt.
 func startTestServerWithInterceptor(t *testing.T, interceptor grpc.UnaryServerInterceptor) (addr string) {
 	t.Helper()
+	return startShardedTestServer(t, interceptor, 1)
+}
+
+// startShardedTestServer serves one single-node Raft group per ID from one
+// KVServer, the way a node hosts its shard groups.
+func startShardedTestServer(t *testing.T, interceptor grpc.UnaryServerInterceptor, groups ...ring.GroupID) (addr string) {
+	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
 
-	kvServer := startSingleNodeRaft(t)
+	replicas := map[ring.GroupID]server.GroupReplica{}
+	for _, group := range groups {
+		replicas[group] = startSingleNodeGroup(t)
+	}
+	kvServer, err := server.NewKVServer(replicas)
+	if err != nil {
+		t.Fatalf("NewKVServer: %v", err)
+	}
 
 	var opts []grpc.ServerOption
 	if interceptor != nil {
@@ -62,15 +78,15 @@ func startTestServerWithInterceptor(t *testing.T, interceptor grpc.UnaryServerIn
 	return listener.Addr().String()
 }
 
-// startSingleNodeRaft runs a real one-node Raft cluster behind a KVServer
-// and waits for it to elect itself, so every write the client sends goes
-// through propose → commit → apply exactly as it does in production. A
-// single node is its own majority, so writes commit the moment they are
-// proposed and the client tests stay fast.
+// startSingleNodeGroup runs a real one-node Raft cluster and waits for it to
+// elect itself, so every write the client sends goes through propose →
+// commit → apply exactly as it does in production. A single node is its own
+// majority, so writes commit the moment they are proposed and the client
+// tests stay fast.
 //
 // Exits (Rule 5): Cleanup stops the node; its applier then closes applyCh,
 // which ends the state machine's Run goroutine.
-func startSingleNodeRaft(t *testing.T) *server.KVServer {
+func startSingleNodeGroup(t *testing.T) server.GroupReplica {
 	t.Helper()
 	dir := t.TempDir()
 	state, err := raft.LoadState(filepath.Join(dir, "raft-state.dat"))
@@ -105,7 +121,18 @@ func startSingleNodeRaft(t *testing.T) *server.KVServer {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	return server.NewKVServer(node, sm)
+	return server.GroupReplica{Raft: node, StateMachine: sm}
+}
+
+// oneGroupRing is the ring of a single-group cluster: every key belongs to
+// group 1, matching the servers these tests start.
+func oneGroupRing(t *testing.T) *ring.Ring {
+	t.Helper()
+	keyRing, err := ring.New([]ring.GroupID{1})
+	if err != nil {
+		t.Fatalf("ring.New: %v", err)
+	}
+	return keyRing
 }
 
 // This test checks the invariant that every retry attempt of a SINGLE
@@ -137,7 +164,7 @@ func TestPut_RetriesReuseSameRequestID(t *testing.T) {
 	}
 
 	addr := startTestServerWithInterceptor(t, interceptor)
-	c, err := NewClient(addr)
+	c, err := NewClient(oneGroupRing(t), addr)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -165,7 +192,7 @@ func TestPut_RetriesReuseSameRequestID(t *testing.T) {
 // unmarshaling all agree with each other.
 func TestPutGetDelete_EndToEnd(t *testing.T) {
 	addr := startTestServer(t)
-	c, err := NewClient(addr)
+	c, err := NewClient(oneGroupRing(t), addr)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -200,7 +227,7 @@ func TestPutGetDelete_EndToEnd(t *testing.T) {
 // correctly reports found=false over the real network path.
 func TestGet_MissingKey_ReturnsNotFound(t *testing.T) {
 	addr := startTestServer(t)
-	c, err := NewClient(addr)
+	c, err := NewClient(oneGroupRing(t), addr)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -221,7 +248,7 @@ func TestGet_MissingKey_ReturnsNotFound(t *testing.T) {
 // nextRequestID were never incremented).
 func TestPut_ConsecutiveCalls_BothApply(t *testing.T) {
 	addr := startTestServer(t)
-	c, err := NewClient(addr)
+	c, err := NewClient(oneGroupRing(t), addr)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -249,7 +276,7 @@ func TestPut_ConsecutiveCalls_BothApply(t *testing.T) {
 // there is no server to connect to at all.
 func TestPut_NoServer_FailsAfterRetries(t *testing.T) {
 	// Nothing is listening on this port.
-	c, err := NewClient("127.0.0.1:1")
+	c, err := NewClient(oneGroupRing(t), "127.0.0.1:1")
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -270,7 +297,7 @@ func TestPut_NoServer_FailsAfterRetries(t *testing.T) {
 // This test checks the invariant that a caller-cancelled context stops
 // retries immediately, rather than waiting out the full backoff schedule.
 func TestPut_ContextCancelled_StopsRetryingEarly(t *testing.T) {
-	c, err := NewClient("127.0.0.1:1") // nothing listening
+	c, err := NewClient(oneGroupRing(t), "127.0.0.1:1") // nothing listening
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -296,7 +323,7 @@ func TestPut_ContextCancelled_StopsRetryingEarly(t *testing.T) {
 // losing it — or reaching a follower — meant failing outright.
 func TestClient_FailsOverPastDeadNode(t *testing.T) {
 	addr := startTestServer(t)
-	c, err := NewClient("127.0.0.1:1", addr) // nothing listens on port 1
+	c, err := NewClient(oneGroupRing(t), "127.0.0.1:1", addr) // nothing listens on port 1
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -314,7 +341,84 @@ func TestClient_FailsOverPastDeadNode(t *testing.T) {
 // This test checks that NewClient refuses an empty address list rather than
 // building a client that would panic on its first call.
 func TestNewClient_RequiresAtLeastOneTarget(t *testing.T) {
-	if _, err := NewClient(); err == nil {
-		t.Fatalf("NewClient() with no targets: err = nil, want an error")
+	if _, err := NewClient(oneGroupRing(t)); err == nil {
+		t.Fatalf("NewClient(oneGroupRing(t)) with no targets: err = nil, want an error")
+	}
+}
+
+// This test checks that the client names the key's group — as ITS ring
+// computes it — on every attempt of every call, retries included. The
+// server refuses any request whose group disagrees with its own ring, so a
+// client that sent the wrong group, or none, could not read or write at
+// all; and one that changed the group between retries would split a single
+// logical write across two groups' dedup tables.
+func TestClient_NamesTheKeysGroupOnEveryAttempt(t *testing.T) {
+	type attempt struct {
+		key   string
+		group uint64
+	}
+	var mu sync.Mutex
+	var attempts []attempt
+	failedOnce := false
+
+	interceptor := func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		var key string
+		var group uint64
+		switch r := req.(type) {
+		case *kvpb.PutRequest:
+			key, group = r.Key, r.GroupId
+		case *kvpb.GetRequest:
+			key, group = r.Key, r.GroupId
+		case *kvpb.DeleteRequest:
+			key, group = r.Key, r.GroupId
+		}
+		mu.Lock()
+		attempts = append(attempts, attempt{key, group})
+		failFirst := !failedOnce
+		failedOnce = true
+		mu.Unlock()
+		if failFirst { // force one retry, to check it names the same group
+			return nil, status.Error(codes.Unavailable, "simulated transient failure")
+		}
+		return handler(ctx, req)
+	}
+	addr := startShardedTestServer(t, interceptor, 1, 2, 3)
+
+	keyRing, err := ring.New([]ring.GroupID{1, 2, 3})
+	if err != nil {
+		t.Fatalf("ring.New: %v", err)
+	}
+	c, err := NewClient(keyRing, addr)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	ctx := context.Background()
+	for i := 0; i < 9; i++ {
+		key := fmt.Sprintf("user:%d", i)
+		if err := c.Put(ctx, key, "v"); err != nil {
+			t.Fatalf("Put(%s): %v", key, err)
+		}
+		if value, found, err := c.Get(ctx, key); err != nil || !found || value != "v" {
+			t.Fatalf("Get(%s) = %q, %v, %v; want v", key, value, found, err)
+		}
+		if err := c.Delete(ctx, key); err != nil {
+			t.Fatalf("Delete(%s): %v", key, err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	groupsSeen := map[uint64]bool{}
+	for _, a := range attempts {
+		if want := uint64(keyRing.Owner(a.key)); a.group != want {
+			t.Fatalf("an attempt for %q named group %d, want %d", a.key, a.group, want)
+		}
+		groupsSeen[a.group] = true
+	}
+	if attempts[0].key != attempts[1].key {
+		t.Fatalf("setup: the first attempt was not retried")
+	}
+	if len(groupsSeen) < 2 {
+		t.Fatalf("setup: every key fell in one group %v, so the test cannot tell groups apart", groupsSeen)
 	}
 }

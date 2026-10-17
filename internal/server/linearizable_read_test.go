@@ -119,7 +119,7 @@ func startSnapshottingCluster(t *testing.T, n int, thresholdBytes int64) ([]*tes
 			<-runDone
 			_ = log.Close()
 		})
-		nodes[i] = &testNode{raft: node, sm: sm, server: NewKVServer(node, sm)}
+		nodes[i] = &testNode{raft: node, sm: sm, server: singleGroupServer(t, node, sm)}
 	}
 
 	// Fill the peer maps BEFORE Start: NewNode keeps a reference to each
@@ -164,7 +164,7 @@ func put(t *testing.T, tn *testNode, key, value, clientID string, requestID uint
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if _, err := tn.server.Put(ctx, &kvpb.PutRequest{Key: key, Value: value, ClientId: clientID, RequestId: requestID}); err != nil {
+	if _, err := tn.server.Put(ctx, &kvpb.PutRequest{GroupId: 1, Key: key, Value: value, ClientId: clientID, RequestId: requestID}); err != nil {
 		t.Fatalf("Put(%s=%s): %v", key, value, err)
 	}
 }
@@ -211,7 +211,7 @@ func TestGet_CutOffFollowerRefusesInsteadOfReturningStaleData(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	resp, err := follower.server.Get(ctx, &kvpb.GetRequest{Key: "x"})
+	resp, err := follower.server.Get(ctx, &kvpb.GetRequest{GroupId: 1, Key: "x"})
 	if err == nil {
 		t.Fatalf("cut-off follower served x=%q — a stale read after x=2 was acknowledged", resp.Value)
 	}
@@ -245,14 +245,14 @@ func TestGet_CutOffOldLeaderCannotServeStaleRead(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	resp, err := oldLeader.server.Get(ctx, &kvpb.GetRequest{Key: "x"})
+	resp, err := oldLeader.server.Get(ctx, &kvpb.GetRequest{GroupId: 1, Key: "x"})
 	if err == nil {
 		t.Fatalf("cut-off old leader served x=%q — a stale read after the new leader committed x=2", resp.Value)
 	}
 	requireCode(t, err, codes.Unavailable)
 
 	// And the read the client retries elsewhere is correct.
-	resp, err = newLeader.server.Get(ctx, &kvpb.GetRequest{Key: "x"})
+	resp, err = newLeader.server.Get(ctx, &kvpb.GetRequest{GroupId: 1, Key: "x"})
 	if err != nil || resp.Value != "2" {
 		t.Fatalf("new leader Get = (%v, %v), want x=\"2\"", resp, err)
 	}

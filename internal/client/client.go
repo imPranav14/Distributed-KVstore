@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/imPranav14/Distributed-KVstore/internal/ring"
 	kvpb "github.com/imPranav14/Distributed-KVstore/proto/kv"
 )
 
@@ -38,15 +39,24 @@ type Client struct {
 	stubs   []kvpb.KVStoreClient
 	current int
 
+	// keyRing tells the client which shard group owns each key. It must be
+	// built from the same groups as the servers' rings; the server checks
+	// the group the client names and refuses a mismatch (Milestone 9c).
+	keyRing *ring.Ring
+
 	clientID      string
 	nextRequestID uint64
 }
 
 // NewClient dials every target (e.g. "localhost:50051", "localhost:50052")
 // and returns a ready-to-use Client with a freshly generated ClientID.
-// Dialing is lazy: no node needs to be up yet. No TLS: out of scope per
-// CLAUDE.md's explicit project boundaries.
-func NewClient(targets ...string) (*Client, error) {
+// keyRing must describe the cluster's shard groups exactly as the servers'
+// rings do. Dialing is lazy: no node needs to be up yet. No TLS: out of
+// scope per CLAUDE.md's explicit project boundaries.
+func NewClient(keyRing *ring.Ring, targets ...string) (*Client, error) {
+	if keyRing == nil {
+		return nil, fmt.Errorf("client: no key ring given")
+	}
 	if len(targets) == 0 {
 		return nil, fmt.Errorf("client: no target addresses given")
 	}
@@ -60,7 +70,7 @@ func NewClient(targets ...string) (*Client, error) {
 		stubs = append(stubs, kvpb.NewKVStoreClient(conn))
 	}
 
-	return &Client{stubs: stubs, clientID: uuid.NewString()}, nil
+	return &Client{stubs: stubs, keyRing: keyRing, clientID: uuid.NewString()}, nil
 }
 
 // Put stores value at key, retrying on failure. requestID is allocated once
@@ -70,10 +80,12 @@ func NewClient(targets ...string) (*Client, error) {
 func (c *Client) Put(ctx context.Context, key, value string) error {
 	requestID := c.nextRequestID
 	c.nextRequestID++
+	// Computed once, like requestID: every attempt names the same group.
+	group := uint64(c.keyRing.Owner(key))
 
 	return c.retryWithBackoff(ctx, func(attemptCtx context.Context, stub kvpb.KVStoreClient) error {
 		_, err := stub.Put(attemptCtx, &kvpb.PutRequest{
-			Key: key, Value: value, ClientId: c.clientID, RequestId: requestID,
+			Key: key, Value: value, ClientId: c.clientID, RequestId: requestID, GroupId: group,
 		})
 		return err
 	})
@@ -84,10 +96,11 @@ func (c *Client) Put(ctx context.Context, key, value string) error {
 func (c *Client) Delete(ctx context.Context, key string) error {
 	requestID := c.nextRequestID
 	c.nextRequestID++
+	group := uint64(c.keyRing.Owner(key))
 
 	return c.retryWithBackoff(ctx, func(attemptCtx context.Context, stub kvpb.KVStoreClient) error {
 		_, err := stub.Delete(attemptCtx, &kvpb.DeleteRequest{
-			Key: key, ClientId: c.clientID, RequestId: requestID,
+			Key: key, ClientId: c.clientID, RequestId: requestID, GroupId: group,
 		})
 		return err
 	})
@@ -98,9 +111,10 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 // and always safe to retry.
 func (c *Client) Get(ctx context.Context, key string) (value string, found bool, err error) {
 	var resp *kvpb.GetResponse
+	group := uint64(c.keyRing.Owner(key))
 	err = c.retryWithBackoff(ctx, func(attemptCtx context.Context, stub kvpb.KVStoreClient) error {
 		var rpcErr error
-		resp, rpcErr = stub.Get(attemptCtx, &kvpb.GetRequest{Key: key})
+		resp, rpcErr = stub.Get(attemptCtx, &kvpb.GetRequest{Key: key, GroupId: group})
 		return rpcErr
 	})
 	if err != nil {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/imPranav14/Distributed-KVstore/internal/dedup"
 	"github.com/imPranav14/Distributed-KVstore/internal/raft"
+	"github.com/imPranav14/Distributed-KVstore/internal/ring"
 	"github.com/imPranav14/Distributed-KVstore/internal/store"
 	kvpb "github.com/imPranav14/Distributed-KVstore/proto/kv"
 	raftpb "github.com/imPranav14/Distributed-KVstore/proto/raft"
@@ -49,6 +50,18 @@ func (unreachablePeer) AppendEntries(ctx context.Context, req *raftpb.AppendEntr
 
 func (unreachablePeer) InstallSnapshot(ctx context.Context, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
 	return nil, errors.New("peer is unreachable")
+}
+
+// singleGroupServer builds a KVServer whose only group is 1. A ring of one
+// group assigns every key to it, so every request these tests send names
+// GroupId 1.
+func singleGroupServer(t *testing.T, node *raft.Node, sm *StateMachine) *KVServer {
+	t.Helper()
+	kvServer, err := NewKVServer(map[ring.GroupID]GroupReplica{1: {Raft: node, StateMachine: sm}})
+	if err != nil {
+		t.Fatalf("NewKVServer: %v", err)
+	}
+	return kvServer
 }
 
 // testNode is one running Raft node plus its state machine and KVServer.
@@ -96,7 +109,7 @@ func startTestNode(t *testing.T, peers map[uint64]raft.Peer) *testNode {
 	return &testNode{
 		raft:        node,
 		sm:          sm,
-		server:      NewKVServer(node, sm),
+		server:      singleGroupServer(t, node, sm),
 		markStopped: func() { stopped = true },
 	}
 }
@@ -134,7 +147,7 @@ func requireCode(t *testing.T, err error, want codes.Code) {
 func TestGet_MissingKey_ReturnsNotFound(t *testing.T) {
 	tn := startSingleNodeLeader(t)
 
-	resp, err := tn.server.Get(context.Background(), &kvpb.GetRequest{Key: "missing"})
+	resp, err := tn.server.Get(context.Background(), &kvpb.GetRequest{GroupId: 1, Key: "missing"})
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -150,11 +163,11 @@ func TestPutThenGet_ValueVisible(t *testing.T) {
 	tn := startSingleNodeLeader(t)
 	ctx := context.Background()
 
-	if _, err := tn.server.Put(ctx, &kvpb.PutRequest{Key: "x", Value: "5", ClientId: "c1", RequestId: 1}); err != nil {
+	if _, err := tn.server.Put(ctx, &kvpb.PutRequest{GroupId: 1, Key: "x", Value: "5", ClientId: "c1", RequestId: 1}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
-	resp, err := tn.server.Get(ctx, &kvpb.GetRequest{Key: "x"})
+	resp, err := tn.server.Get(ctx, &kvpb.GetRequest{GroupId: 1, Key: "x"})
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -171,14 +184,14 @@ func TestPut_DuplicateRequestID_AppliedOnce(t *testing.T) {
 	tn := startSingleNodeLeader(t)
 	ctx := context.Background()
 
-	if _, err := tn.server.Put(ctx, &kvpb.PutRequest{Key: "x", Value: "first", ClientId: "c1", RequestId: 1}); err != nil {
+	if _, err := tn.server.Put(ctx, &kvpb.PutRequest{GroupId: 1, Key: "x", Value: "first", ClientId: "c1", RequestId: 1}); err != nil {
 		t.Fatalf("first Put: %v", err)
 	}
-	if _, err := tn.server.Put(ctx, &kvpb.PutRequest{Key: "x", Value: "second-should-be-ignored", ClientId: "c1", RequestId: 1}); err != nil {
+	if _, err := tn.server.Put(ctx, &kvpb.PutRequest{GroupId: 1, Key: "x", Value: "second-should-be-ignored", ClientId: "c1", RequestId: 1}); err != nil {
 		t.Fatalf("retried Put: %v, want OK — the request was applied once already", err)
 	}
 
-	resp, _ := tn.server.Get(ctx, &kvpb.GetRequest{Key: "x"})
+	resp, _ := tn.server.Get(ctx, &kvpb.GetRequest{GroupId: 1, Key: "x"})
 	if resp.Value != "first" {
 		t.Fatalf("value = %q, want \"first\" — the retry was applied a second time", resp.Value)
 	}
@@ -190,14 +203,14 @@ func TestDelete_RemovesKey(t *testing.T) {
 	tn := startSingleNodeLeader(t)
 	ctx := context.Background()
 
-	if _, err := tn.server.Put(ctx, &kvpb.PutRequest{Key: "x", Value: "5", ClientId: "c1", RequestId: 1}); err != nil {
+	if _, err := tn.server.Put(ctx, &kvpb.PutRequest{GroupId: 1, Key: "x", Value: "5", ClientId: "c1", RequestId: 1}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if _, err := tn.server.Delete(ctx, &kvpb.DeleteRequest{Key: "x", ClientId: "c1", RequestId: 2}); err != nil {
+	if _, err := tn.server.Delete(ctx, &kvpb.DeleteRequest{GroupId: 1, Key: "x", ClientId: "c1", RequestId: 2}); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 
-	resp, _ := tn.server.Get(ctx, &kvpb.GetRequest{Key: "x"})
+	resp, _ := tn.server.Get(ctx, &kvpb.GetRequest{GroupId: 1, Key: "x"})
 	if resp.Found {
 		t.Fatalf("Get after Delete: Found = true, want false")
 	}
@@ -212,10 +225,10 @@ func TestPutAndGet_OnFollower_ReturnNotLeader(t *testing.T) {
 	tn := startTestNode(t, map[uint64]raft.Peer{2: unreachablePeer{}})
 	ctx := context.Background()
 
-	_, err := tn.server.Put(ctx, &kvpb.PutRequest{Key: "x", Value: "5", ClientId: "c1", RequestId: 1})
+	_, err := tn.server.Put(ctx, &kvpb.PutRequest{GroupId: 1, Key: "x", Value: "5", ClientId: "c1", RequestId: 1})
 	requireCode(t, err, codes.Unavailable)
 
-	_, err = tn.server.Get(ctx, &kvpb.GetRequest{Key: "x"})
+	_, err = tn.server.Get(ctx, &kvpb.GetRequest{GroupId: 1, Key: "x"})
 	requireCode(t, err, codes.Unavailable)
 }
 
@@ -234,7 +247,7 @@ func TestPut_LeadershipLostBeforeCommit_ReturnsErrorNotOK(t *testing.T) {
 
 	putResult := make(chan error, 1)
 	go func() {
-		_, err := tn.server.Put(context.Background(), &kvpb.PutRequest{Key: "x", Value: "mine", ClientId: "c1", RequestId: 1})
+		_, err := tn.server.Put(context.Background(), &kvpb.PutRequest{GroupId: 1, Key: "x", Value: "mine", ClientId: "c1", RequestId: 1})
 		putResult <- err
 	}()
 
@@ -286,7 +299,7 @@ func TestPut_CannotCommit_ReturnsDeadlineExceeded(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	_, err := tn.server.Put(ctx, &kvpb.PutRequest{Key: "x", Value: "5", ClientId: "c1", RequestId: 1})
+	_, err := tn.server.Put(ctx, &kvpb.PutRequest{GroupId: 1, Key: "x", Value: "5", ClientId: "c1", RequestId: 1})
 	requireCode(t, err, codes.DeadlineExceeded)
 }
 
@@ -303,7 +316,7 @@ func TestPut_NodeStopReleasesWaitingHandlers(t *testing.T) {
 
 	putResult := make(chan error, 1)
 	go func() {
-		_, err := tn.server.Put(context.Background(), &kvpb.PutRequest{Key: "x", Value: "5", ClientId: "c1", RequestId: 1})
+		_, err := tn.server.Put(context.Background(), &kvpb.PutRequest{GroupId: 1, Key: "x", Value: "5", ClientId: "c1", RequestId: 1})
 		putResult <- err
 	}()
 	waitFor(t, func() bool { _, ok := tn.raft.TermAt(2); return ok })

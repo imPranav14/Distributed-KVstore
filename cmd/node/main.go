@@ -121,7 +121,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	kvServer := server.NewKVServer(raftNode, stateMachine)
+	// One group for now (9d runs SHARD_GROUPS of them). A ring of one group
+	// assigns every key to group 1, so behavior is unchanged.
+	kvServer, err := server.NewKVServer(map[ring.GroupID]server.GroupReplica{
+		onlyGroup: {Raft: raftNode, StateMachine: stateMachine},
+	})
+	if err != nil {
+		slog.Error("node: failed to create kv server", "error", err)
+		os.Exit(1)
+	}
 	raftServer, err := server.NewRaftServer(map[ring.GroupID]*raft.Node{onlyGroup: raftNode})
 	if err != nil {
 		slog.Error("node: failed to create raft server", "error", err)

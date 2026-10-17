@@ -227,7 +227,7 @@ func startSnapshottingNode(t *testing.T, dir string, thresholdBytes int64) *snap
 	}
 	t.Cleanup(stop)
 	waitForRole(t, node, raft.Leader)
-	return &snapshottingNode{raft: node, sm: sm, server: NewKVServer(node, sm), stop: stop}
+	return &snapshottingNode{raft: node, sm: sm, server: singleGroupServer(t, node, sm), stop: stop}
 }
 
 // This test checks the promise of the whole milestone: with snapshots on,
@@ -244,7 +244,7 @@ func TestSnapshots_BoundLogSizeAndSurviveRestart(t *testing.T) {
 	var largestLog int64
 	for i := 0; i < writes; i++ {
 		key := fmt.Sprintf("key-%02d", i%keys)
-		if _, err := node.server.Put(ctx, &kvpb.PutRequest{Key: key, Value: fmt.Sprint(i), ClientId: "c1", RequestId: uint64(i + 1)}); err != nil {
+		if _, err := node.server.Put(ctx, &kvpb.PutRequest{GroupId: 1, Key: key, Value: fmt.Sprint(i), ClientId: "c1", RequestId: uint64(i + 1)}); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 		if size := node.raft.LogSize(); size > largestLog {
@@ -269,7 +269,7 @@ func TestSnapshots_BoundLogSizeAndSurviveRestart(t *testing.T) {
 	for k := 0; k < keys; k++ {
 		key := fmt.Sprintf("key-%02d", k)
 		want := fmt.Sprint(writes - keys + k) // the last write to this key
-		resp, err := restarted.server.Get(waitCtx, &kvpb.GetRequest{Key: key})
+		resp, err := restarted.server.Get(waitCtx, &kvpb.GetRequest{GroupId: 1, Key: key})
 		if err != nil {
 			t.Fatalf("Get(%s) after restart: %v", key, err)
 		}
@@ -292,7 +292,7 @@ func TestSnapshots_EveryAcknowledgedWriteSurvivesRestart(t *testing.T) {
 	node := startSnapshottingNode(t, dir, threshold)
 	ctx := context.Background()
 	for i := 1; i <= writes; i++ {
-		put := &kvpb.PutRequest{Key: fmt.Sprintf("key-%03d", i), Value: fmt.Sprint(i), ClientId: "c1", RequestId: uint64(i)}
+		put := &kvpb.PutRequest{GroupId: 1, Key: fmt.Sprintf("key-%03d", i), Value: fmt.Sprint(i), ClientId: "c1", RequestId: uint64(i)}
 		if _, err := node.server.Put(ctx, put); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
@@ -312,7 +312,7 @@ func TestSnapshots_EveryAcknowledgedWriteSurvivesRestart(t *testing.T) {
 	defer cancel()
 	// A linearizable read first, so the restarted node has applied
 	// everything it knows about before the store is inspected directly.
-	if _, err := restarted.server.Get(waitCtx, &kvpb.GetRequest{Key: "key-001"}); err != nil {
+	if _, err := restarted.server.Get(waitCtx, &kvpb.GetRequest{GroupId: 1, Key: "key-001"}); err != nil {
 		t.Fatalf("Get after restart: %v", err)
 	}
 	var lost []string
@@ -341,7 +341,7 @@ func putToCurrentLeader(t *testing.T, nodes []*testNode, key, value, clientID st
 	for time.Now().Before(deadline) {
 		for _, tn := range nodes {
 			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-			_, err := tn.server.Put(ctx, &kvpb.PutRequest{Key: key, Value: value, ClientId: clientID, RequestId: requestID})
+			_, err := tn.server.Put(ctx, &kvpb.PutRequest{GroupId: 1, Key: key, Value: value, ClientId: clientID, RequestId: requestID})
 			cancel()
 			if err == nil {
 				return
@@ -445,7 +445,7 @@ func TestBreak_NeverCompact(t *testing.T) {
 		started := time.Now()
 		for i := 0; i < writes; i++ {
 			key := fmt.Sprintf("key-%04d", i%keys)
-			if _, err := node.server.Put(ctx, &kvpb.PutRequest{Key: key, Value: fmt.Sprint(i), ClientId: "c1", RequestId: uint64(i + 1)}); err != nil {
+			if _, err := node.server.Put(ctx, &kvpb.PutRequest{GroupId: 1, Key: key, Value: fmt.Sprint(i), ClientId: "c1", RequestId: uint64(i + 1)}); err != nil {
 				t.Fatalf("%s: Put %d: %v", mode.name, i, err)
 			}
 		}
@@ -460,7 +460,7 @@ func TestBreak_NeverCompact(t *testing.T) {
 		restarted := startSnapshottingNode(t, dir, mode.threshold)
 		lastKey := fmt.Sprintf("key-%04d", (writes-1)%keys)
 		waitCtx, cancel := context.WithTimeout(ctx, time.Minute)
-		resp, err := restarted.server.Get(waitCtx, &kvpb.GetRequest{Key: lastKey})
+		resp, err := restarted.server.Get(waitCtx, &kvpb.GetRequest{GroupId: 1, Key: lastKey})
 		cancel()
 		if err != nil || resp.Value != fmt.Sprint(writes-1) {
 			t.Fatalf("%s: after restart Get(%s) = %v, %v; want %d", mode.name, lastKey, resp, err, writes-1)

@@ -233,7 +233,7 @@ func newGroupReplica(t *testing.T, nodeID uint64, peers map[uint64]raft.Peer) (r
 		}()
 		node.Start()
 	}
-	return &testNode{raft: node, sm: sm, server: NewKVServer(node, sm)}, start
+	return &testNode{raft: node, sm: sm, server: singleGroupServer(t, node, sm)}, start
 }
 
 // This test checks both halves of the invariant together, over real gRPC:

@@ -2590,4 +2590,150 @@ Deferred to the end of Milestone 9.
 
 ---
 
+## Milestone 9c — Sharded KV Routing
+Date: 2026-10-17
+
+### The Problem This Solves
+Once a process hosts several groups, each request must be served by the
+group that owns its key. A write in the wrong group commits durably where no
+correct read will look. A read in the wrong group answers a clean "not
+found", which is a stale read that looks correct. And if the client and
+server disagree about the ring, that has to surface as an error, not as data
+in the wrong place.
+
+### The Design Decision Made
+- **Re-split again (Rule 2).** The planned 9c (config, layout guard, log
+  labels, N groups in `main.go` *and* routing) was about 400 lines. Now:
+  - 9c is routing only; `main.go` still runs one group, and a one-group ring
+    sends every key to group 1.
+  - 9d runs N groups per node.
+  - 9e adds per-group leader guesses in the client, plus end to end.
+- **The client sends `group_id`, and the server verifies it** against its own
+  ring, refusing a mismatch with `FailedPrecondition` (not `Unavailable`,
+  which means "try another node"). Group 0 is refused, as in 9b.
+- **The KV server builds its ring from the groups it hosts**, so within a
+  process the ring can't name a group without a local replica.
+- **Checked before proposing, never at apply.** `Command` and the state
+  machine are unchanged. Applying stays deterministic and independent of any
+  replica's config.
+- **Reads are checked too.** A wrong-group `Get` is the stale-read case.
+- **Pseudocode change:** the client-level skew test would have taken minutes,
+  because the client retries every error with backoff. It was split into a
+  server-level skew test plus a client test that every attempt names
+  `ring.Owner(key)`.
+
+### Consistent Hashing Makes Ring Skew Fail Safe
+A ring with one extra group agrees with the smaller ring on every key except
+those it gives the extra group. So a client and server that disagree about
+the group count disagree *only* about keys involving the group one of them
+lacks. Every other key works normally. Measured over 60 keys against
+3-group servers:
+- **Client with an extra group 4:** 46 written, 14 refused. Every refusal
+  was a key the client gave to group 4.
+- **Client missing group 3:** 40 written, 20 refused. Every refusal was a key
+  the servers own in group 3.
+
+No key on which both sides have the group was ever refused or misrouted.
+With modulo hashing, any count mismatch would disagree on most keys.
+
+The server check is what turns both directions into errors. Without it, the
+**missing-group** direction silently commits writes in groups 1 or 2, since
+those groups exist everywhere.
+
+### How It Works — Plain English
+The client looks up the key on its copy of the ring and writes the group
+number on the request, the same number on every retry. The server looks the
+key up on *its* ring:
+- **Numbers match:** it hands the request to its replica of that group, and
+  everything from Milestones 7 and 8 happens inside that group as before.
+- **They don't:** it refuses, before anything is written anywhere.
+
+### Key Invariants
+- INVARIANT (`kv_server.go`, `replicaFor`): an operation runs only in the
+  group that owns its key, and the check happens BEFORE anything is
+  proposed — never at apply time.
+- The request's group must equal the server ring's owner; any ring
+  disagreement becomes an error.
+- `KVServer`'s ring and replica map are read-only after construction, and
+  the ring is built from exactly the hosted groups.
+- The client computes the group once per logical call and reuses it on every
+  retry, exactly like the request ID.
+
+### The Lines That Matter Most
+
+Line: `if ring.GroupID(requestedGroup) != owner { return FailedPrecondition }`
+Does: refuses any request whose group disagrees with this server's ring.
+Breaks if the server trusts the client instead (M1, verified): a
+missing-group-3 client wrote `skew-02` into group 2, though the server owns
+it in group 3. A wrong-group read answered `found=false`. The extra-group-4
+skew case still **passed**, masked because group 4 isn't hosted here. That is
+why the skew test runs both directions.
+Breaks if the server ignores the client instead (M2, verified): every
+mismatch was accepted. The data landed correctly, because routing used the
+server's ring, but the config mismatch went undetected. That is exactly what
+lets a server-side mismatch silently misroute.
+
+Line: `replica, err := s.replicaFor(req.GroupId, req.Key)` at the top of `Get`
+Does: applies the same check to reads.
+Breaks if `Get` alone trusts the client (M3, verified): only the read test
+failed, with `answered found=false`, a silent stale read. Correction to my
+pseudocode: a `Get` that *ignores* the client returns the right data; the
+stale read comes from *trusting* it.
+
+Line: `group := uint64(c.keyRing.Owner(key))`, computed before the retry
+loop
+Does: names the same group on every attempt.
+Breaks if not sent (M4, verified): every client `Put` was refused as group 0
+(`the request named group 0`), so five client tests failed. Each one burned
+all 5 retry attempts, about 1.8s, on an error that can never succeed.
+
+Line: `keyRing, err := ring.New(groups)` from the replica map's keys, in
+`NewKVServer`
+Does: makes the server's ring and its hosted groups the same set by
+construction.
+Why this way: a separately configured ring could name a group with no local
+replica. Building it from the replicas removes that state rather than
+checking for it.
+
+### What Breaks and Why
+All four breaks were caught. Two predictions were sharpened after writing
+the tests, and both held:
+- M1 passes one skew direction. Hosting acts as an accidental check, but
+  only when the misnamed group doesn't exist.
+- A `Get` that ignores the client is correct; one that trusts it is stale.
+
+### Verification
+- New tests:
+  - keys land only in their owner (30 keys across 3 groups)
+  - a wrong-group write leaves every group's log size unchanged, proving
+    nothing was proposed
+  - a wrong-group read is refused, not answered "not found"
+  - construction refuses group 0
+  - skew fails safe in both directions
+  - the client names `ring.Owner(key)` on every attempt, including a forced
+    retry
+- All existing suites pass through single-group servers. Tests that call the
+  server directly now name `GroupId: 1`.
+- **Not separately verified:** `main.go`'s KV wiring change (one group, a
+  few lines). It builds, but no binary-level run exercised it; 9e's end to
+  end will.
+
+### Interview Questions and Answers
+Deferred to the end of Milestone 9.
+
+### Git Commit Message
+`feat: route KV requests to the key's shard group and refuse mismatches`
+
+### Open Questions
+- **The client retries `FailedPrecondition` like any error.** That is
+  useful when *servers* disagree (a retry may reach one that agrees), but it
+  wastes about 1.8s when the *client* is the misconfigured one. Failing fast
+  on it is a candidate change for 9e.
+- **A real shard move would need this check in the log.** If ownership could
+  change, a request checked before proposing could commit after the move.
+  MIT 6.5840 puts the config epoch *through* the log and checks it at apply
+  time. Static config (4A) avoids this today.
+
+---
+
 <!-- All future entries go below this line, in chronological order -->
