@@ -2871,4 +2871,143 @@ Deferred to the end of Milestone 9.
 
 ---
 
+## Milestone 9e — A Client Built for Many Groups: Per-Group Leaders and a Classified Retry Policy
+Date: 2026-10-18
+
+### The Problem This Solves
+Before 9e the client had **one** leader guess shared by all groups. With
+leaders g1 → node 3 and g2, g3 → node 2 (the 9d smoke run), every switch
+between groups started at the wrong node: 2 wasted calls and 300ms of
+backoff per switch. The client also retried a ring mismatch
+(`FailedPrecondition`) like any error, wasting about 1.8s on something
+waiting can't fix. And it had no clear answer for a group that can never
+elect a leader.
+
+### The Design Decision Made
+- **One leader guess per group** (`map[group]node`), updated only when a node
+  actually serves the group. Rejected: leader hints in NotLeader replies
+  (Raft doesn't track the leader's identity), and keeping one guess.
+- **Every failure falls into exactly one class, and all classes share one
+  attempt budget:**
+
+| Class | Codes | Action |
+|---|---|---|
+| Caller is done | the caller's context ended (checked before classifying) | stop; wrap the context error |
+| Routing refusal | `FailedPrecondition` | mark the node refused (never asked again in this call); no backoff; if every node refused → `ErrRingMismatch` |
+| Leader discovery | `Unavailable`; `DeadlineExceeded` when only the attempt timed out | next eligible node, with backoff; the node stays eligible |
+| Permanent | anything else | return at once |
+
+- **Refusals are tracked as a per-call set of distinct nodes, not a count.**
+  This came from review: my first pseudocode counted refusals and kept
+  round-robining, which with nodes A and C refusing and B mid-election goes
+  A, B, C, then **A again**. That hits 3 refusals and wrongly concludes the
+  client's ring is wrong while B agrees.
+- **NotLeader is not a refusal** because the server checks ownership
+  *before* leadership. A NotLeader reply proves that node's ring agrees.
+  That order is now an INVARIANT on the server, with a test.
+- **The caller's deadline wins on every path**, including the refusal path,
+  which never sleeps. If the caller's deadline expires *during* an attempt,
+  that is reported as the caller's, never as "no leader reachable".
+- **Errors you can check:** `ErrNoLeaderReachable` and `ErrRingMismatch`,
+  each also wrapping the last gRPC error, so `status.Code` still works.
+- **A `retryPolicy` struct** replaces the four constants. The defaults are
+  unchanged; tests pass a fast policy. The worst case with no caller
+  deadline is 5 × 2s + 1.5s ≈ 11.5s, then `ErrNoLeaderReachable`.
+- **Rule 2 split:** the end-to-end integration test moved to 9f.
+
+### How It Works — Plain English
+For each key the client works out its group and starts at the node that
+last served that group. If a node says "wrong group", the client crosses it
+off for this call and tries the next immediately, because waiting won't
+change a config disagreement. If *every* node crosses off, the client's own
+config is the problem. If a node says "not leader", or doesn't answer, the
+client tries the next node after a short, growing pause, giving an election
+time to finish. Every one of these attempts comes out of the same budget of
+5, and the caller's own deadline cuts the whole thing short at any point.
+
+### Key Invariants
+- INVARIANT (`client.go`, `retry`): ONE attempt budget covers every failure
+  class, so a call always ends, even against a group that can never elect
+  a leader.
+- INVARIANT (`client.go`, unchanged and extended): every attempt of one call
+  carries the same request ID **and** the same group; any error for a write
+  means "outcome unknown".
+- INVARIANT (`kv_server.go`, `replicaFor`): ownership is checked before
+  leadership, so NotLeader implies the node's ring agrees.
+- A refused node is never asked again within one call; the guess only ever
+  points to a node that served the group.
+
+### The Lines That Matter Most
+
+Line: `refused[node] = true` plus `if len(refused) == len(c.stubs)`
+Does: counts distinct refusing nodes and ends the call once all have refused.
+Breaks as a plain counter (M1, verified): the NotLeader test ended in
+`ErrRingMismatch` while B agreed, and A was asked again (`[A B C A B]`).
+
+Line: `case codes.Unavailable, codes.DeadlineExceeded:` (NotLeader is
+discovery, not refusal)
+Does: keeps a NotLeader node eligible and backs off.
+Breaks if NotLeader counts as a refusal (M2, verified): six tests failed.
+The two that hit real servers show the real cost:
+- One transient `Unavailable` made the client declare a ring mismatch.
+- With nothing listening, the client gave up after **1.3ms** instead of
+  backing off for 1.5s.
+
+Line: `if !refused[candidate]` in `nextEligible`
+Does: skips nodes that refused in this call.
+Breaks without it (M3, verified): `calls = [A B C A B], want [A B C B]`.
+
+Line: `if ctx.Err() != nil { return callerStopped(...) }` after a failed
+attempt
+Does: attributes a failure caused by the caller's own deadline to the
+caller.
+Breaks without it (M7, verified as predicted): only the last-attempt test
+failed (`no leader reachable ... after 1 attempts`). On every other path the
+top-of-loop check or the backoff sleep notices the expired context anyway.
+The check exists so the final attempt doesn't blame the cluster for the
+caller's deadline.
+
+Line: `c.leaderGuess[group] = node`
+Does: remembers each group's leader separately.
+Breaks with one shared guess (M8, verified): **30 wasted attempts in 30
+alternating calls**, exactly one wrong first guess per group switch.
+
+### What Breaks and Why
+All nine breaks were caught. The ones not covered above:
+
+| Break | Result |
+|---|---|
+| M4: leadership checked before ownership | the follower test got `Unavailable`, not `FailedPrecondition` |
+| M5: permanent errors retried | the `InvalidArgument` call "succeeded" on the next node |
+| M6: no caller-context check at the top of the loop | an already-cancelled `Put` made a call **and succeeded**, because the fake ignores its context. Against a real server, gRPC refuses a cancelled context itself, which partly masks this in production; only the explicit check is verifiable here |
+| M9: backoff on refusals | the fail-fast tests took 602ms and 201ms |
+
+Also fixed: error messages stuttered (`client: group 1: client: every node
+refused`). They now read `client: every node refused the key's group; ...
+(group 1): rpc error: code = FailedPrecondition ...`.
+
+### Verification
+- All 20 client tests pass: the 9 existing ones untouched by the policy
+  change, and 11 new. Timing-sensitive tests were repeated 20× under
+  `-race`, with no failures.
+- The server test pins the check order on a real follower: wrong group →
+  `FailedPrecondition`; right group → `Unavailable`.
+
+### Interview Questions and Answers
+Deferred to the end of Milestone 9.
+
+### Git Commit Message
+`feat: per-group leader guesses and a bounded, classified client retry policy`
+
+### Open Questions
+- **The guess goes stale after a leader change** and costs one discovery
+  round per group. Leader hints would fix that, but need Raft to track the
+  leader's identity.
+- **Backoff has no jitter.** Many clients failing over together retry in
+  lockstep. Production clients randomize backoff.
+- **The policy is fixed at construction.** Real clients often expose it as
+  an option.
+
+---
+
 <!-- All future entries go below this line, in chronological order -->

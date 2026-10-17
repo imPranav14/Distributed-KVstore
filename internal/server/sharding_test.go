@@ -202,3 +202,28 @@ func TestRingSkew_FailsSafeInBothDirections(t *testing.T) {
 		})
 	}
 }
+
+// This test checks the INVARIANT that ownership is checked before
+// leadership. A follower — which cannot serve anything — must still answer a
+// wrong-group request with FailedPrecondition, not Unavailable. The client
+// depends on that order: it treats NotLeader as "this node agrees with my
+// ring, keep it eligible" and FailedPrecondition as "this node disagrees,
+// never ask it again in this call".
+func TestKVServer_WrongGroupOnAFollower_IsRefusedNotNotLeader(t *testing.T) {
+	// One unreachable peer: this node needs 2 of 2 votes, so it stays a follower.
+	follower := startTestNode(t, map[uint64]raft.Peer{2: unreachablePeer{}})
+	if follower.raft.Role() == raft.Leader {
+		t.Fatalf("setup: the node is leader, want a follower")
+	}
+	ctx := context.Background()
+
+	_, err := follower.server.Put(ctx, &kvpb.PutRequest{Key: "x", Value: "v", ClientId: "c1", RequestId: 1, GroupId: 2})
+	requireCode(t, err, codes.FailedPrecondition)
+	_, err = follower.server.Get(ctx, &kvpb.GetRequest{Key: "x", GroupId: 2})
+	requireCode(t, err, codes.FailedPrecondition)
+
+	// The right group on the same follower is Unavailable — proving the
+	// refusal above came from the ownership check, not from leadership.
+	_, err = follower.server.Put(ctx, &kvpb.PutRequest{Key: "x", Value: "v", ClientId: "c1", RequestId: 1, GroupId: 1})
+	requireCode(t, err, codes.Unavailable)
+}

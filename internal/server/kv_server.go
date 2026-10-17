@@ -93,6 +93,14 @@ func NewKVServer(replicas map[ring.GroupID]GroupReplica) (*KVServer, error) {
 // The request's group is the one the CLIENT computed from its own ring.
 // Requiring it to match this node's ring turns any ring disagreement into
 // an error rather than a write in a group the other side would not look in.
+//
+// INVARIANT: every handler calls this FIRST — ownership is checked before
+// leadership (before ReadIndex or Propose). The client relies on the order:
+// a NotLeader reply then proves this node's ring AGREES with the client's,
+// so the client keeps the node eligible instead of treating it as a routing
+// refusal. Checking leadership first would let a node whose ring disagrees
+// answer NotLeader, and the client would keep retrying a node that can
+// never serve it.
 func (s *KVServer) replicaFor(requestedGroup uint64, key string) (GroupReplica, error) {
 	owner := s.keyRing.Owner(key)
 	if ring.GroupID(requestedGroup) != owner {
