@@ -116,6 +116,10 @@ type Node struct {
 
 	stopCh chan struct{} // closed by Stop(); read by run()'s select loop
 
+	// stopOnce makes Stop safe to call more than once: closing stopCh a
+	// second time would panic.
+	stopOnce sync.Once
+
 	// logger writes this node's log lines. Set once in NewNode, before any
 	// goroutine exists, and never written again — so it is read without mu.
 	// Since Milestone 9 a process runs one node per shard group, and the
@@ -210,13 +214,12 @@ func (n *Node) Start() {
 	n.mu.Unlock()
 }
 
-// Stop signals the background loop to exit. NOT idempotent — calling it
-// twice panics (closing an already-closed channel), same as the standard
-// library's own close(). A real shutdown sequence only ever calls this
-// once; callers that might otherwise stop the same Node from two places
-// must guard against that themselves.
+// Stop signals the background loop and the applier to exit. Safe to call
+// more than once: since Milestone 9 a node can be stopped on its own (one
+// shard group) and again when its whole process shuts down, and closing
+// stopCh twice would panic.
 func (n *Node) Stop() {
-	close(n.stopCh)
+	n.stopOnce.Do(func() { close(n.stopCh) })
 }
 
 // Role returns the node's current role. Exported for tests and for

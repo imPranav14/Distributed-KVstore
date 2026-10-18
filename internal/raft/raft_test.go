@@ -419,3 +419,14 @@ func (g *gatedPeer) AppendEntries(ctx context.Context, req *raftpb.AppendEntries
 func (g *gatedPeer) InstallSnapshot(ctx context.Context, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
 	return g.inner.InstallSnapshot(ctx, req)
 }
+
+// This test checks that Stop is safe to call more than once. A node can be
+// stopped on its own — a test stopping one shard group's replica — and then
+// again when its whole process shuts down. Closing stopCh twice would panic
+// and take the process down with it.
+func TestStop_IsSafeToCallTwice(t *testing.T) {
+	n := newTestNode(t, 1)
+	n.Start()
+	n.Stop()
+	n.Stop()
+}

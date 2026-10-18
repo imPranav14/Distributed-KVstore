@@ -3010,4 +3010,134 @@ Deferred to the end of Milestone 9.
 
 ---
 
+## Milestone 9f — Extracting StartNode So Tests Run the Wiring That Ships
+Date: 2026-10-18
+
+### The Problem This Solves
+Entries 9c and 9d both noted that `main.go`'s wiring was not covered by any
+test: the pin call, per-group directories, the shutdown order. A
+`package main` can't be imported, so an end-to-end test could only test a
+*copy* of that wiring, which can drift from what ships. 9f moves the wiring
+into `server.StartNode`, which `main` and the tests both call.
+
+### The Design Decision Made
+Options for the end-to-end test:
+- **A. The test copies the wiring:** no production change, but it tests a
+  copy.
+- **B. Extract `StartNode`:** tests what ships. *Chosen.*
+- **C. Exec the real binary:** the most faithful, but slow, and it can't stop
+  a single group, because groups live and die with their process.
+
+Rule 2 splits B into 9f (the extraction) and 9g (the integration tests).
+
+What the extraction required:
+- **No `os.Exit` in a library.** A failed state machine is reported on
+  `Fatal()`; `main` still exits at once (fail-stop, unchanged).
+- **Cleanup on a failed start.** `main` relied on the process exiting;
+  `StartNode` must close everything it opened, including the listener it
+  owns from the moment it is called.
+- **State machines start only after every group has opened.** In `main` each
+  one started inside the per-group setup. A failure partway would leave the
+  earlier groups' state machines blocked forever on channels nothing would
+  close.
+- **`raft.Node.Stop` became safe to call twice** (`sync.Once`). A test stops
+  one group's replica on its own, and then the node shuts down. Its comment
+  previously warned that a second call panics.
+- **`StartNode` takes a listener**, so tests can open `:0` ports first and
+  learn their addresses before building each node's peer list.
+
+### How It Works — Plain English
+`main` is now four steps: read the config, listen on the port, call
+`StartNode`, then wait for a shutdown signal or a fatal error. `StartNode`
+does what `main` used to do, in the same order: pin the group count, dial
+the peers, open every group's files, build every group's Raft node and state
+machine, serve gRPC, and start everything. If anything fails partway, it
+undoes what it did and returns the error, instead of exiting.
+
+### Key Invariants
+- INVARIANT (`node.go`, moved from `main`): the group count is pinned
+  BEFORE any group directory is created. **Now tested:** a refused start
+  must create no `group-4/`.
+- `StartNode` owns the listener: it is served on success and closed on
+  failure.
+- A failed start leaves nothing behind: no open files, no goroutines, no
+  bound port.
+- Every group's state machine starts only after every group has opened.
+- `raft.Node.Stop` and `NodeRuntime.Stop` are both safe to call twice.
+
+### The Lines That Matter Most
+
+Line: `func StartNode(...) (_ *NodeRuntime, err error)` with
+`nodeRuntime := &NodeRuntime{...}`
+Does: lets the deferred cleanup see `err` while building the node in a
+local variable.
+Broke for real on the first run: the first draft named the result
+`runtime`, and every `return nil, err` assigned `nil` to it **before** the
+deferred cleanup ran. The cleanup then called `shutdown()` on a nil pointer
+(`nil pointer dereference ... (*NodeRuntime).shutdown(0x0)`). It was caught
+by the first test that exercised a failed start. This is Go's named-result
+trap: deferred functions see the results *after* the return statement has
+assigned them.
+
+Line: the `defer` that calls `shutdown()` and `listener.Close()` on failure
+Does: releases everything a failed start opened.
+Breaks without it (M2, verified): `open files: 8 before (with the listener),
+9 after; want 7`. Group 1's log and the listener were both leaked.
+
+Line: starting each state machine in the loop *after* every group has
+opened
+Does: ensures a failed start leaves no goroutine blocked forever.
+Breaks with `main`'s old order (M3, verified): `goroutines: 2 before, 3
+after`. Exactly one leak: group 1's apply loop. (The first M3 mutant didn't
+compile; the compile check caught it before its result could mislead.)
+
+Line: `config.PinShardGroups(...)` before the group loop
+Does: pins the count before any group directory exists.
+Breaks if moved after (M4, verified): `a refused start created group-4/`. In
+9d this ordering lived in `main` and was "argued, not tested". Extraction
+made it testable.
+
+Line: `n.stopOnce.Do(func() { close(n.stopCh) })` in `raft.Node.Stop`
+Does: makes a second `Stop` harmless.
+Breaks without it (M6, verified): `panic: close of closed channel` in both
+double-`Stop` tests.
+
+### What Breaks and Why
+- M1 (no pin call): caught by both wiring tests.
+- M7 (`NodeRuntime.Stop` without its own `stopOnce`) **survived**, as
+  predicted. With `raft.Node.Stop` idempotent, a second shutdown only logs
+  "already closed" errors, so `stopOnce` is defensive, not load-bearing.
+- The failed-start test first **skipped** on macOS, because `os.ReadDir`
+  stats each `/dev/fd` entry and that fails. A skip is not a pass, so it now
+  counts descriptors by name only and runs for real (5/5).
+
+### Verification — Real Binaries
+The 9d smoke script, unchanged, against the refactored `main`:
+- every group elected a leader
+- the layout was `group-1/ group-2/ group-3/ shard-groups`
+- `SHARD_GROUPS=4` exited with code 1
+- a pre-sharding directory exited with code 1
+
+Its rejoin check showed only groups 2 and 3. That turned out to be the
+script stopping at the first log line: a follower whose term doesn't change
+never logs. Silence isn't proof, so a functional check followed:
+1. Node 2 led **all three** groups (leader placement again).
+2. Node 1 was restarted from its data directory, then node 2 was killed.
+3. All three groups re-elected **node 1** as leader in term 2, with 2 votes
+   each, which is impossible unless node 1 rejoined every group.
+
+### Interview Questions and Answers
+Deferred to the end of Milestone 9.
+
+### Git Commit Message
+`refactor: extract node wiring into server.StartNode with clean failure and idempotent stop`
+
+### Open Questions
+- **Leader placement**, now observed three times: one node led every group
+  in this run. Leader transfer would be needed to balance it.
+- **`Fatal()` delivers one error per failed group**, but `main` acts on the
+  first. That is enough for fail-stop; a supervisor might want all of them.
+
+---
+
 <!-- All future entries go below this line, in chronological order -->
