@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -271,26 +272,26 @@ func TestPut_ConsecutiveCalls_BothApply(t *testing.T) {
 	}
 }
 
-// This test checks the invariant that retryWithBackoff gives up after
-// maxAttempts and returns an error, rather than retrying forever, when
-// there is no server to connect to at all.
-func TestPut_NoServer_FailsAfterRetries(t *testing.T) {
+// This test checks, over a real socket, that a client with no server to
+// reach keeps trying for its whole budget — not one quick round — and then
+// gives up with ErrNoLeaderReachable rather than retrying forever.
+func TestPut_NoServer_FailsAfterItsBudget(t *testing.T) {
 	// Nothing is listening on this port.
 	c, err := NewClient(oneGroupRing(t), "127.0.0.1:1")
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
+	c.policy.totalBudget = 300 * time.Millisecond // the default 5s, shortened to keep the test quick
 
 	start := time.Now()
 	err = c.Put(context.Background(), "x", "5")
 	elapsed := time.Since(start)
 
-	if err == nil {
-		t.Fatalf("Put against a non-listening address: err = nil, want an error")
+	if !errors.Is(err, ErrNoLeaderReachable) {
+		t.Fatalf("Put against a non-listening address: err = %v, want ErrNoLeaderReachable", err)
 	}
-	// Backoff between 5 attempts is 100+200+400+800 = 1500ms minimum.
-	if elapsed < 1500*time.Millisecond {
-		t.Fatalf("Put failed after only %v, want at least 1.5s (backoff was skipped)", elapsed)
+	if elapsed < 300*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("Put failed after %v, want it to keep trying for its 300ms budget and then stop", elapsed)
 	}
 }
 

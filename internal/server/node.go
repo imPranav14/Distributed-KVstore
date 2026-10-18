@@ -51,7 +51,11 @@ type NodeRuntime struct {
 // file and connection opened so far is released too. When this code lived
 // in main.go a failure meant os.Exit and the OS cleaned up; a function that
 // returns an error has to do that itself.
-func StartNode(cfg *config.Config, listener net.Listener) (_ *NodeRuntime, err error) {
+//
+// grpcOptions are passed to the gRPC server. main passes none; the
+// integration tests pass an interceptor that can cut one shard group's
+// traffic on one node, to fail a single group without failing the node.
+func StartNode(cfg *config.Config, listener net.Listener, grpcOptions ...grpc.ServerOption) (_ *NodeRuntime, err error) {
 	// Built in a local, NOT in a named result: every `return nil, err` below
 	// assigns nil to the named results BEFORE deferred functions run, so a
 	// cleanup reading a named result would find nil and dereference it.
@@ -124,7 +128,7 @@ func StartNode(cfg *config.Config, listener net.Listener) (_ *NodeRuntime, err e
 		return nil, fmt.Errorf("server: StartNode: %w", err)
 	}
 
-	nodeRuntime.grpcServer = grpc.NewServer()
+	nodeRuntime.grpcServer = grpc.NewServer(grpcOptions...)
 	kvpb.RegisterKVStoreServer(nodeRuntime.grpcServer, kvServer)
 	raftpb.RegisterRaftServer(nodeRuntime.grpcServer, raftServer) // same server, same port as KVStore
 

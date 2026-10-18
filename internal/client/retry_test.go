@@ -89,12 +89,33 @@ func hang(ctx context.Context, _ uint64, _ int) error {
 	return status.FromContextError(ctx.Err()).Err()
 }
 
-// fastPolicy keeps unit tests in milliseconds.
-var fastPolicy = retryPolicy{maxAttempts: 5, baseBackoff: 5 * time.Millisecond, maxBackoff: 20 * time.Millisecond, perAttemptTimeout: 20 * time.Millisecond}
+// fastPolicy keeps unit tests short: a 300ms budget, 5ms backoff capped at 20ms.
+var fastPolicy = retryPolicy{totalBudget: 300 * time.Millisecond, baseBackoff: 5 * time.Millisecond, maxBackoff: 20 * time.Millisecond, perAttemptTimeout: 20 * time.Millisecond}
 
 // slowBackoffPolicy makes any backoff obvious in elapsed time, to prove a
 // path took none.
-var slowBackoffPolicy = retryPolicy{maxAttempts: 5, baseBackoff: 200 * time.Millisecond, maxBackoff: time.Second, perAttemptTimeout: 100 * time.Millisecond}
+var slowBackoffPolicy = retryPolicy{totalBudget: 2 * time.Second, baseBackoff: 200 * time.Millisecond, maxBackoff: time.Second, perAttemptTimeout: 100 * time.Millisecond}
+
+// endsAtTheBudget checks a call that never succeeded ran for its whole
+// budget — no shorter, and not much longer.
+func endsAtTheBudget(t *testing.T, elapsed time.Duration, policy retryPolicy) {
+	t.Helper()
+	if elapsed < policy.totalBudget || elapsed > policy.totalBudget+200*time.Millisecond {
+		t.Fatalf("call took %v, want it to keep trying for its %v budget and then stop", elapsed, policy.totalBudget)
+	}
+}
+
+// askedMoreThanOnce checks every named node was asked repeatedly — the
+// client kept cycling instead of giving up after one rotation.
+func askedMoreThanOnce(t *testing.T, calls []string, nodes ...string) {
+	t.Helper()
+	joined := strings.Join(calls, "")
+	for _, node := range nodes {
+		if strings.Count(joined, node) < 2 {
+			t.Fatalf("calls %v: node %s was asked fewer than twice — the client stopped cycling", calls, node)
+		}
+	}
+}
 
 // newFakeClient builds a client over fake nodes named A, B, C, ...
 func newFakeClient(t *testing.T, policy retryPolicy, keyRing *ring.Ring, responders ...func(context.Context, uint64, int) error) (*Client, []*fakeNode, *callLog) {
@@ -229,22 +250,24 @@ func TestClient_NotLeaderIsNotARefusal(t *testing.T) {
 
 // This test checks that ONE budget bounds every path, and that a refused
 // node is never asked again within a call. A refuses; B and C never have a
-// leader. The client spends exactly maxAttempts calls, asks A once, and
-// reports that no leader could be reached.
+// leader. The client keeps cycling B and C for the whole budget, never asks
+// A again, and reports that no leader could be reached.
 func TestClient_OneBudget_RefusedNodesAreNotRevisited(t *testing.T) {
 	c, _, log := newFakeClient(t, fastPolicy, nil, refuse, notLeader, notLeader)
 
+	start := time.Now()
 	err := c.Put(context.Background(), "x", "v")
+	elapsed := time.Since(start)
+
 	if !errors.Is(err, ErrNoLeaderReachable) {
 		t.Fatalf("err = %v, want ErrNoLeaderReachable", err)
 	}
+	endsAtTheBudget(t, elapsed, fastPolicy)
 	calls := log.calls()
-	if len(calls) != fastPolicy.maxAttempts {
-		t.Fatalf("made %d calls %v, want exactly maxAttempts = %d", len(calls), calls, fastPolicy.maxAttempts)
-	}
 	if strings.Count(strings.Join(calls, ""), "A") != 1 {
 		t.Fatalf("calls = %v: the refusing node A was asked more than once", calls)
 	}
+	askedMoreThanOnce(t, calls, "B", "C")
 }
 
 // This test checks the no-majority case: a group that cannot elect a
@@ -254,16 +277,18 @@ func TestClient_OneBudget_RefusedNodesAreNotRevisited(t *testing.T) {
 func TestClient_NoLeaderAnywhere_StopsWithNoLeaderReachable(t *testing.T) {
 	c, _, log := newFakeClient(t, fastPolicy, nil, notLeader, notLeader, notLeader)
 
+	start := time.Now()
 	err := c.Put(context.Background(), "x", "v")
+	elapsed := time.Since(start)
+
 	if !errors.Is(err, ErrNoLeaderReachable) {
 		t.Fatalf("err = %v, want ErrNoLeaderReachable", err)
 	}
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("status.Code(err) = %v, want the last attempt's Unavailable to stay inspectable", status.Code(err))
 	}
-	if len(log.calls()) != fastPolicy.maxAttempts {
-		t.Fatalf("made %d calls, want %d", len(log.calls()), fastPolicy.maxAttempts)
-	}
+	endsAtTheBudget(t, elapsed, fastPolicy)
+	askedMoreThanOnce(t, log.calls(), "A", "B", "C")
 }
 
 // This test checks the timeout path: every node hangs until the ATTEMPT's
@@ -279,12 +304,8 @@ func TestClient_EveryAttemptTimesOut_StopsWithinTheBudget(t *testing.T) {
 	if !errors.Is(err, ErrNoLeaderReachable) || status.Code(err) != codes.DeadlineExceeded {
 		t.Fatalf("err = %v, want ErrNoLeaderReachable wrapping DeadlineExceeded", err)
 	}
-	if len(log.calls()) != fastPolicy.maxAttempts {
-		t.Fatalf("made %d calls, want %d", len(log.calls()), fastPolicy.maxAttempts)
-	}
-	if elapsed > time.Second {
-		t.Fatalf("took %v — the budget did not bound the timeouts", elapsed)
-	}
+	endsAtTheBudget(t, elapsed, fastPolicy)
+	askedMoreThanOnce(t, log.calls(), "A", "B", "C")
 }
 
 // This test checks that the caller's deadline wins over the attempt budget:
@@ -300,22 +321,22 @@ func TestClient_CallerDeadlineShorterThanBudget_ReturnsAtTheDeadline(t *testing.
 	err := c.Put(ctx, "x", "v")
 	elapsed := time.Since(start)
 
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err = %v, want it to wrap context.DeadlineExceeded", err)
+	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrNoLeaderReachable) {
+		t.Fatalf("err = %v, want the caller's context.DeadlineExceeded, not ErrNoLeaderReachable", err)
 	}
-	if len(log.calls()) >= slowBackoffPolicy.maxAttempts {
-		t.Fatalf("made %d calls — the deadline did not cut the budget short", len(log.calls()))
+	if len(log.calls()) > 1 {
+		t.Fatalf("made %d calls — the 50ms deadline should end the call during its first 200ms backoff", len(log.calls()))
 	}
 	if elapsed > 150*time.Millisecond {
 		t.Fatalf("took %v, want about the 50ms deadline", elapsed)
 	}
 }
 
-// This test checks that when the caller's deadline expires DURING the final
+// This test checks that when the caller's deadline expires DURING an
 // attempt, the error says so — rather than blaming the cluster with
 // ErrNoLeaderReachable. The node never failed; the caller stopped waiting.
-func TestClient_CallerDeadlineDuringLastAttempt_IsReportedAsTheCallers(t *testing.T) {
-	policy := retryPolicy{maxAttempts: 1, baseBackoff: time.Millisecond, maxBackoff: time.Millisecond, perAttemptTimeout: time.Second}
+func TestClient_CallerDeadlineMidAttempt_IsReportedAsTheCallers(t *testing.T) {
+	policy := retryPolicy{totalBudget: time.Second, baseBackoff: time.Millisecond, maxBackoff: time.Millisecond, perAttemptTimeout: time.Second}
 	c, _, _ := newFakeClient(t, policy, nil, hang)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
@@ -326,6 +347,20 @@ func TestClient_CallerDeadlineDuringLastAttempt_IsReportedAsTheCallers(t *testin
 	}
 	if errors.Is(err, ErrNoLeaderReachable) {
 		t.Fatalf("err = %v: the caller's own deadline was blamed on the cluster", err)
+	}
+}
+
+// This test checks the converse: when OUR budget expires during an attempt
+// and the caller set no deadline, the error is ErrNoLeaderReachable — not
+// context.DeadlineExceeded, which would tell the caller its own deadline
+// expired when it never set one.
+func TestClient_OurBudgetMidAttempt_IsReportedAsNoLeaderReachable(t *testing.T) {
+	policy := retryPolicy{totalBudget: 30 * time.Millisecond, baseBackoff: time.Millisecond, maxBackoff: time.Millisecond, perAttemptTimeout: time.Second}
+	c, _, _ := newFakeClient(t, policy, nil, hang)
+
+	err := c.Put(context.Background(), "x", "v")
+	if !errors.Is(err, ErrNoLeaderReachable) || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want ErrNoLeaderReachable and NOT the caller's context.DeadlineExceeded", err)
 	}
 }
 
@@ -357,5 +392,28 @@ func TestClient_PermanentError_IsReturnedWithoutRetrying(t *testing.T) {
 	}
 	if calls := log.calls(); len(calls) != 1 {
 		t.Fatalf("made calls %v, want exactly one", calls)
+	}
+}
+
+// This test checks the bug the integration tests found: a leader elected
+// LATE in a call must still be found. A and B are never leader; C becomes
+// leader 150ms into the call — as after a split vote. A budget counted in
+// attempts, spent round-robin with growing gaps, visits C once before it
+// wins and never again, and reports "no leader reachable" while a leader
+// exists. A budget counted in time, with short capped backoff, keeps
+// revisiting every node until the budget ends.
+func TestClient_LeaderElectedLateIsStillFound(t *testing.T) {
+	callStarted := time.Now()
+	leaderAfter150ms := func(context.Context, uint64, int) error {
+		if time.Since(callStarted) < 150*time.Millisecond {
+			return status.Error(codes.Unavailable, "not leader")
+		}
+		return nil
+	}
+	c, _, log := newFakeClient(t, fastPolicy, nil, notLeader, notLeader, leaderAfter150ms)
+
+	callStarted = time.Now()
+	if err := c.Put(context.Background(), "x", "v"); err != nil {
+		t.Fatalf("Put: %v (calls %v) — a leader elected 150ms in was never found", err, log.calls())
 	}
 }

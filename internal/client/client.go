@@ -22,35 +22,45 @@ import (
 	kvpb "github.com/imPranav14/Distributed-KVstore/proto/kv"
 )
 
-// retryPolicy bounds how hard one logical call tries before giving up.
+// retryPolicy bounds how long one logical call keeps trying.
+//
+// The budget is TIME, not a number of attempts (Milestone 9g). An attempt
+// count spent round-robin with growing gaps visits each node only once or
+// twice, early: after a split vote, the new leader's turn could come just
+// BEFORE it won, and the call reported "no leader reachable" while a leader
+// existed (found by the integration tests). A time budget with short,
+// capped backoff keeps revisiting every node for as long as it lasts.
 type retryPolicy struct {
-	// maxAttempts is the ONE budget shared by every kind of failure —
+	// totalBudget is the ONE budget shared by every kind of failure —
 	// refusals, NotLeader, unreachable nodes and timeouts alike — so a call
-	// always ends, even against a group that can never elect a leader.
-	maxAttempts int
+	// always ends, even against a group that can never elect a leader. A
+	// caller's own deadline wins if it is sooner.
+	totalBudget time.Duration
 
 	// After a leader-discovery failure the client waits baseBackoff × 2^n,
-	// capped at maxBackoff, giving an election time to finish.
+	// capped at maxBackoff. The cap is what matters: with 3 nodes and a
+	// 250ms cap, every node is asked at least every ~750ms, so a leader
+	// elected at any point in the budget is found soon after.
 	baseBackoff time.Duration
 	maxBackoff  time.Duration
 
 	// perAttemptTimeout bounds one call to one node, so a hung node costs
-	// one attempt rather than the whole call.
+	// one attempt rather than the whole call. An attempt never outlives the
+	// budget.
 	perAttemptTimeout time.Duration
 }
 
 // defaultRetryPolicy is what NewClient uses. With no caller deadline, a call
-// that never finds a leader ends after at most 5 × 2s of attempts plus
-// 100+200+400+800ms of backoff — about 11.5s — with ErrNoLeaderReachable.
+// that never finds a leader ends after 5s with ErrNoLeaderReachable.
 var defaultRetryPolicy = retryPolicy{
-	maxAttempts:       5,
-	baseBackoff:       100 * time.Millisecond,
-	maxBackoff:        2 * time.Second,
+	totalBudget:       5 * time.Second,
+	baseBackoff:       25 * time.Millisecond,
+	maxBackoff:        250 * time.Millisecond,
 	perAttemptTimeout: 2 * time.Second,
 }
 
 var (
-	// ErrNoLeaderReachable means the attempt budget ran out without any node
+	// ErrNoLeaderReachable means the retry budget ran out without any node
 	// serving the key's group — every node was unreachable, timed out, or
 	// was not the leader (for example because the group has lost its
 	// majority). The last gRPC error is wrapped alongside it.
@@ -177,7 +187,7 @@ func (c *Client) Get(ctx context.Context, key string) (value string, found bool,
 	return resp.Value, resp.Found, nil
 }
 
-// retry runs fn against one node at a time until it succeeds, the attempt
+// retry runs fn against one node at a time until it succeeds, the time
 // budget runs out, or the caller's context ends. Every failure falls into
 // exactly one class:
 //
@@ -198,9 +208,13 @@ func (c *Client) Get(ctx context.Context, key string) (value string, found bool,
 //   - Anything else is permanent (InvalidArgument, Internal, ...): no node
 //     and no amount of waiting will change it, so it is returned at once.
 //
-// INVARIANT: ONE attempt budget (policy.maxAttempts) covers every class, so
-// a call always ends — even against a group that has lost its majority and
-// can never elect a leader. It ends with ErrNoLeaderReachable.
+// INVARIANT: ONE time budget (policy.totalBudget) covers every class, so a
+// call always ends — even against a group that has lost its majority and
+// can never elect a leader. It ends with ErrNoLeaderReachable. It cannot
+// spin either: every attempt and every backoff is bounded by the budget,
+// each node can refuse at most once per call (so refusals, which skip
+// backoff, happen at most len(nodes) times), and every other failure sleeps
+// at least baseBackoff.
 //
 // INVARIANT: every attempt of one logical call — including attempts that
 // land on DIFFERENT nodes — carries the same request ID and the same group,
@@ -209,32 +223,48 @@ func (c *Client) Get(ctx context.Context, key string) (value string, found bool,
 // replicated dedup table skips the retry. It is also why every error this
 // returns for a write means "outcome unknown", never "not applied".
 func (c *Client) retry(ctx context.Context, group ring.GroupID, fn func(context.Context, kvpb.KVStoreClient) error) error {
+	// budgetCtx ends when OUR budget does — or sooner, with the caller's
+	// context, since it is derived from it. That is how the two are told
+	// apart below: ctx done means the caller stopped; only budgetCtx done
+	// means our budget ran out.
+	budgetCtx, cancelBudget := context.WithTimeout(ctx, c.policy.totalBudget)
+	defer cancelBudget()
+
 	node := c.leaderGuess[group] // a group never seen starts at node 0
 	refused := make(map[int]bool, len(c.stubs))
 	var lastErr error
+	attempts := 0
 
-	for attempt := 0; attempt < c.policy.maxAttempts; attempt++ {
-		// The caller's deadline or cancellation always wins over the budget —
-		// including on the refusal path, which never sleeps and so would
-		// otherwise never notice it.
+	for {
+		// The caller's deadline or cancellation always wins — including on
+		// the refusal path, which never sleeps and so would otherwise never
+		// notice it.
 		if ctx.Err() != nil {
 			return callerStopped(group, ctx.Err(), lastErr)
 		}
+		if budgetCtx.Err() != nil {
+			break
+		}
 
-		attemptCtx, cancel := context.WithTimeout(ctx, c.policy.perAttemptTimeout)
+		attemptCtx, cancel := context.WithTimeout(budgetCtx, c.policy.perAttemptTimeout)
 		err := fn(attemptCtx, c.stubs[node])
 		cancel()
+		attempts++
 		if err == nil {
 			c.leaderGuess[group] = node // only a node that SERVED the group becomes the guess
 			return nil
 		}
 		lastErr = err
 
-		// The attempt may have failed only because the CALLER's context
-		// ended mid-call. That is not this node's fault, and on the last
-		// attempt it must not be reported as "no leader reachable".
+		// The attempt may have failed only because a context above it ended
+		// mid-call. Neither is this node's fault: the caller's context is
+		// reported as the caller's, and our own budget as "no leader
+		// reachable" — never the other way round.
 		if ctx.Err() != nil {
 			return callerStopped(group, ctx.Err(), lastErr)
+		}
+		if budgetCtx.Err() != nil {
+			break
 		}
 
 		switch status.Code(err) {
@@ -250,19 +280,19 @@ func (c *Client) retry(ctx context.Context, group ring.GroupID, fn func(context.
 
 		case codes.Unavailable, codes.DeadlineExceeded:
 			node = c.nextEligible(node, refused)
-			if attempt == c.policy.maxAttempts-1 {
-				break // no point sleeping before giving up
-			}
-			if err := c.sleepBackoff(ctx, attempt); err != nil {
-				return callerStopped(group, err, lastErr)
-			}
+			// Interrupted by either context; the top of the loop then says
+			// which one ended.
+			c.sleepBackoff(budgetCtx, attempts-1)
 
 		default:
 			return err
 		}
 	}
 
-	return fmt.Errorf("%w (group %d, %d attempts): %w", ErrNoLeaderReachable, group, c.policy.maxAttempts, lastErr)
+	if lastErr == nil {
+		return fmt.Errorf("%w (group %d): the %v budget ended before any attempt", ErrNoLeaderReachable, group, c.policy.totalBudget)
+	}
+	return fmt.Errorf("%w (group %d, %d attempts in %v): %w", ErrNoLeaderReachable, group, attempts, c.policy.totalBudget, lastErr)
 }
 
 // nextEligible returns the next node after from, round-robin, skipping
@@ -279,20 +309,24 @@ func (c *Client) nextEligible(from int, refused map[int]bool) int {
 	return from // unreachable: some node is always eligible here
 }
 
-// sleepBackoff waits baseBackoff × 2^attempt, capped at maxBackoff, and
-// returns early with the context's error if the caller's context ends first.
-func (c *Client) sleepBackoff(ctx context.Context, attempt int) error {
-	backoff := c.policy.baseBackoff << attempt // baseBackoff * 2^attempt
-	if backoff > c.policy.maxBackoff || backoff <= 0 {
+// sleepBackoff waits baseBackoff × 2^attempt, capped at maxBackoff, or
+// until ctx ends, whichever is first.
+//
+// Doubled step by step rather than shifted: with a time budget a call can
+// make dozens of attempts, and baseBackoff << attempt would overflow.
+func (c *Client) sleepBackoff(ctx context.Context, attempt int) {
+	backoff := c.policy.baseBackoff
+	for i := 0; i < attempt && backoff < c.policy.maxBackoff; i++ {
+		backoff *= 2
+	}
+	if backoff > c.policy.maxBackoff {
 		backoff = c.policy.maxBackoff
 	}
 	timer := time.NewTimer(backoff)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
-		return nil
 	case <-ctx.Done():
-		return ctx.Err()
 	}
 }
 

@@ -3140,4 +3140,166 @@ Deferred to the end of Milestone 9.
 
 ---
 
+## Milestone 9g — End-to-End Tests, and the Client Bug They Found
+Date: 2026-10-18
+
+### The Problem This Solves
+Every earlier test exercised one layer with the others faked. 9g runs the
+whole system:
+- three nodes built by `server.StartNode`, the same wiring `main` runs;
+- three shard groups each;
+- real gRPC on localhost, driven by the real client.
+
+It asks the questions only the whole system can answer. Do keys stay in
+their group across real replicas? Does a node that dies and returns catch up
+in every group? Does InstallSnapshot work over the real network, per group?
+Is one group's failure contained?
+
+### The Design Decision Made
+- **The tests use `StartNode`** (9f), so they test what ships.
+- **Failing a single group needs a network cut, not just `Stop`.**
+  - A stopped `raft.Node` still answers RPCs; only its timers and applier
+    stop. So "stopped" replicas kept acknowledging AppendEntries, and the
+    group stayed available.
+  - `StartNode` now takes optional gRPC server options. The tests pass an
+    interceptor that refuses every request naming a cut group, using the
+    `GetGroupId()` every request type has.
+  - A dead replica is Stop **plus** cut.
+- **An honest framing.** With every node hosting every group, a real node
+  failure hits all groups at once. A single-group failure (say, one group's
+  disk) is the rarer case, so the test proves the groups are independent,
+  not a common failure mode.
+
+### The Bug the End-to-End Tests Found, and Its Fix
+The node-failure test failed in **2 of 5** full-package runs:
+`no leader reachable ... (group 3, 5 attempts): not leader`.
+
+The election log showed group 3 *did* have a leader. A diagnostic copy with
+millisecond timestamps showed why the client missed it:
+
+| Time | Event |
+|---|---|
+| .889 | attempt 1 → node 1: Unavailable (just stopped) |
+| .990 | attempt 2 → node 2: not leader |
+| 03.160 / .174 | nodes 2 and 3 both start elections for term 2: split vote |
+| 03.192 | attempt 3 → node 3: not leader (candidate) |
+| **03.438** | **node 3 elected leader, term 3** |
+| 03.592 | attempt 4 → node 1: Unavailable (still dead) |
+| 04.394 | attempt 5 → node 2: not leader → **ErrNoLeaderReachable** |
+
+**Root cause.** 9e's budget counted *attempts*. Spent round-robin with
+growing gaps, that visits each node once or twice, early. After a split vote
+the new leader's turn came before it won, and never came again. The fake
+nodes in the unit tests never have elections in progress, so only the
+integration test could find this.
+
+**The fix: option C, a time budget.** Chosen with the user over three
+alternatives:
+- A: make the tests wait for leaders. Rejected: it hides a real bug.
+- B: more attempts. Still counts attempts.
+- D: leader hints. The right long-term answer, but spans three layers.
+
+The new budget is a total duration: 5s by default, or the caller's deadline
+if sooner. Backoff is short and capped (25ms doubling to 250ms), so with 3
+nodes every node is asked at least every ~750ms for the whole budget.
+Everything else from 9e is unchanged.
+
+Making it robust:
+- `budgetCtx` is derived from the caller's context. "Caller's context done"
+  means the caller stopped, reported as theirs. "Only `budgetCtx` done"
+  means our budget ran out: `ErrNoLeaderReachable`.
+- Backoff is doubled step by step instead of `base << attempt`, which would
+  overflow now that a call can make dozens of attempts.
+- **Red before green.** The new regression test (a leader elected 150ms
+  into the call) failed on the old policy with `calls [A B C A B]` and
+  passes on the new one, finding the leader at about 210ms.
+
+**Proof:** 10 full-package runs passed every test, 40 of 40, versus 2
+failing runs in 5 before.
+
+### How It Works — Plain English
+The client now thinks in time, not tries: "keep asking around for up to 5
+seconds, pausing at most a quarter second between tries." An election that
+needs a few rounds finishes well inside that, and because the pauses stay
+short, the client keeps coming back to every node, including the one that
+just won.
+
+### The Four End-to-End Tests and What They Showed
+1. **Keys spread and stay in their group:** 60 keys through the client, each
+   on all 3 replicas of its owning group and on no other group's replicas.
+2. **A whole node dies and returns:**
+   - Every key stays readable and writable with node 1 down.
+   - Restarted from its data directory on the same address, node 1 caught
+     up in every group in about 1s.
+3. **Catch-up through snapshots, over real gRPC, per group:**
+   - Setup proved both running replicas had compacted every group past
+     node 1's last entry, so ordinary log entries *could not* catch it up.
+   - Node 1 caught up in every group (0.8–2.4s), and its own snapshot moved
+     past its old last index.
+   - This is the first time InstallSnapshot has run over the real network
+     with group IDs.
+4. **One group loses its majority:**
+   - Groups 1 and 3 kept serving.
+   - Asked directly, group 2's isolated leader **rejected a read in 2ms**,
+     because ReadIndex can't confirm a majority.
+   - It **held a write for the full 3s** until the caller gave up: with no
+     CheckQuorum, it never learns it has lost its followers.
+   - Through the client, both ended with `ErrNoLeaderReachable` within the
+     budget.
+
+### Key Invariants
+- INVARIANT (`client.go`, revised): ONE **time** budget covers every
+  failure class. The loop can't spin: each node refuses at most once per
+  call, every other failure sleeps at least `baseBackoff`, and every attempt
+  and sleep is bounded by the budget.
+- The caller's deadline is reported as the caller's; our budget is reported
+  as `ErrNoLeaderReachable`. Never the other way round.
+- (Test harness) A dead replica is Stop **and** cut; a stopped node alone
+  still answers RPCs.
+
+### The Lines That Matter Most
+
+Line: `budgetCtx, cancelBudget := context.WithTimeout(ctx, c.policy.totalBudget)`
+Does: makes the limit a duration, still cut short by the caller's deadline.
+Why this way: the attempt count was the bug; deriving from `ctx` is what
+lets the two endings be told apart.
+
+Line: `maxBackoff: 250 * time.Millisecond`
+Does: caps the gap between tries, so every node is revisited throughout the
+budget.
+Why this way: the cap, not the budget size, is what fixes the bug. The old
+2s cap and doubling from 100ms left a 1.5s-wide hole after the first
+rotation.
+
+Line: `if budgetCtx.Err() != nil { break }` after an attempt, checked
+*after* `ctx.Err()`
+Does: reports our own budget expiring as `ErrNoLeaderReachable`.
+Verified by `TestClient_OurBudgetMidAttempt_IsReportedAsNoLeaderReachable`
+(and its mirror for the caller's deadline).
+
+### What Breaks and Why — 9g Mutants
+| Break | Result |
+|---|---|
+| B1: all groups share one directory | both restart tests failed: `log entry at offset 20 has index 1`. 9d's break B3, only checkable by hand until now, is an automated failure |
+| B2: `groupPeer.InstallSnapshot` doesn't stamp its group | only the snapshot test failed (`node 1, group 3` never caught up); snapshots arrived as group 0 and were refused |
+| B3: the leader never sends a snapshot | only the snapshot test failed, the same way |
+
+### Interview Questions and Answers
+Below, in the Milestone 9 interview.
+
+### Git Commit Message
+`test: end-to-end sharded cluster tests; client retries on a time budget`
+
+### Open Questions
+- **CheckQuorum.** An isolated leader holds writes until the caller gives
+  up, observed directly. The fix is for a leader that hasn't heard from a
+  majority within an election timeout to step down.
+- **Leader hints (option D).** They would turn "search the nodes" into "go
+  straight to the leader".
+- **Backoff jitter.** Many clients failing over together still retry in
+  lockstep.
+- **Docker.** The real-container run for Milestones 7–9 is still deferred.
+
+---
+
 <!-- All future entries go below this line, in chronological order -->
